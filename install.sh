@@ -335,6 +335,64 @@ create_database_and_user() {
   mysql_exec "FLUSH PRIVILEGES;"
 }
 
+# Pelican's `p:environment:database` always runs confirm("Do you want to continue?") with default NO.
+# With --no-interaction that aborts immediately; interactively it blocks on the prompt (red warnings).
+# We set MySQL credentials in .env instead, then migrate (see pelican-dev/panel DatabaseSettingsCommand.php).
+wait_for_mysql_user() {
+  local db_user="$1" db_pass="$2"
+  local tries=0
+  info "Waiting for MySQL to accept TCP logins for ${db_user}@127.0.0.1…"
+  while [[ $tries -lt 45 ]]; do
+    if mysql -h 127.0.0.1 -u "$db_user" -p"$db_pass" -e "SELECT 1" &>/dev/null; then
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 1
+  done
+  error "MySQL did not accept credentials at 127.0.0.1:3306 within 45s (check mariadb bind-address / firewall)."
+  exit 1
+}
+
+escape_dotenv_double() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+apply_mysql_to_dotenv() {
+  local db_name="$1" db_user="$2" db_pass="$3"
+  local env_file="$PELICAN_ROOT/.env"
+  [[ -f "$env_file" ]] || { error "Missing $env_file (p:environment:setup failed?)"; exit 1; }
+  local tmp
+  tmp=$(mktemp)
+  grep -vE '^DB_(CONNECTION|HOST|PORT|DATABASE|USERNAME|PASSWORD|SOCKET)=' "$env_file" > "$tmp" 2>/dev/null || cp "$env_file" "$tmp"
+  {
+    echo "DB_CONNECTION=mysql"
+    echo "DB_HOST=127.0.0.1"
+    echo "DB_PORT=3306"
+    echo "DB_DATABASE=${db_name}"
+    echo "DB_USERNAME=${db_user}"
+    echo "DB_PASSWORD=\"$(escape_dotenv_double "$db_pass")\""
+  } >> "$tmp"
+  mv "$tmp" "$env_file"
+}
+
+apply_pgsql_to_dotenv() {
+  local db_name="$1" db_user="$2" db_pass="$3"
+  local env_file="$PELICAN_ROOT/.env"
+  [[ -f "$env_file" ]] || { error "Missing $env_file (p:environment:setup failed?)"; exit 1; }
+  local tmp
+  tmp=$(mktemp)
+  grep -vE '^DB_(CONNECTION|HOST|PORT|DATABASE|USERNAME|PASSWORD|SOCKET)=' "$env_file" > "$tmp" 2>/dev/null || cp "$env_file" "$tmp"
+  {
+    echo "DB_CONNECTION=pgsql"
+    echo "DB_HOST=127.0.0.1"
+    echo "DB_PORT=5432"
+    echo "DB_DATABASE=${db_name}"
+    echo "DB_USERNAME=${db_user}"
+    echo "DB_PASSWORD=\"$(escape_dotenv_double "$db_pass")\""
+  } >> "$tmp"
+  mv "$tmp" "$env_file"
+}
+
 # ---------------------------------------------------------------------------
 # Panel: download & composer
 # ---------------------------------------------------------------------------
@@ -375,13 +433,10 @@ configure_panel_env() {
   pushd "$PELICAN_ROOT" >/dev/null
   php artisan p:environment:setup --no-interaction
 
-  php artisan p:environment:database --no-interaction \
-    --driver=mysql \
-    --database="$db_name" \
-    --host=127.0.0.1 \
-    --port=3306 \
-    --username="$db_user" \
-    --password="$db_pass"
+  wait_for_mysql_user "$db_user" "$db_pass"
+  info "Writing MySQL settings to .env (skipping interactive p:environment:database)…"
+  apply_mysql_to_dotenv "$db_name" "$db_user" "$db_pass"
+  php artisan config:clear --no-interaction
 
   php artisan migrate --force --no-interaction
   popd >/dev/null
@@ -820,21 +875,14 @@ run_manual() {
     pushd "$PELICAN_ROOT" >/dev/null
     php artisan p:environment:setup --no-interaction
     if [[ "$db_driver" == "mysql" ]]; then
-      php artisan p:environment:database --no-interaction \
-        --driver=mysql \
-        --database="$db_name" \
-        --host=127.0.0.1 \
-        --port=3306 \
-        --username="$db_user" \
-        --password="$db_pass"
+      wait_for_mysql_user "$db_user" "$db_pass"
+      info "Writing MySQL settings to .env…"
+      apply_mysql_to_dotenv "$db_name" "$db_user" "$db_pass"
+      php artisan config:clear --no-interaction
     elif [[ "$db_driver" == "pgsql" ]]; then
-      php artisan p:environment:database --no-interaction \
-        --driver=pgsql \
-        --database="$db_name" \
-        --host=127.0.0.1 \
-        --port=5432 \
-        --username="$db_user" \
-        --password="$db_pass"
+      info "Writing PostgreSQL settings to .env…"
+      apply_pgsql_to_dotenv "$db_name" "$db_user" "$db_pass"
+      php artisan config:clear --no-interaction
     fi
     if [[ "$db_driver" != "sqlite" ]]; then
       php artisan migrate --force --no-interaction

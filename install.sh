@@ -703,12 +703,27 @@ print_summary() {
   fi
   if [[ -n "${SUMMARY[panel_url]:-}" ]]; then
     printf '  %s%-22s%s %s\n' "$BOLD" "Panel URL" "$RESET" "${SUMMARY[panel_url]}"
-    printf '  %s%-22s%s %s\n' "$BOLD" "Web installer" "$RESET" "${SUMMARY[panel_url]}/installer (if needed)"
+    printf '  %s%-22s%s %s\n' "$BOLD" "Web installer URL" "$RESET" "${SUMMARY[panel_url]}/installer"
   fi
   if [[ -n "${SUMMARY[db_name]:-}" ]]; then
-    printf '  %s%-22s%s %s\n' "$BOLD" "Database name" "$RESET" "${SUMMARY[db_name]}"
-    printf '  %s%-22s%s %s\n' "$BOLD" "Database user" "$RESET" "${SUMMARY[db_user]}"
-    printf '  %s%-22s%s %s\n' "$BOLD" "Database password" "$RESET" "${SUMMARY[db_password]}"
+    echo
+    printf '  %s%s%s\n' "$C_HEAD" "  Web installer — Database step (same values if you finish setup in the browser)" "$RESET"
+    if [[ -n "${SUMMARY[db_ui_driver]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Driver (dropdown)" "$RESET" "${SUMMARY[db_ui_driver]}"
+    fi
+    if [[ -n "${SUMMARY[db_engine]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Engine / .env" "$RESET" "${SUMMARY[db_engine]}"
+    fi
+    if [[ -n "${SUMMARY[db_host]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Host" "$RESET" "${SUMMARY[db_host]}"
+    fi
+    if [[ -n "${SUMMARY[db_port]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Port" "$RESET" "${SUMMARY[db_port]}"
+    fi
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Database name" "$RESET" "${SUMMARY[db_name]}"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Username" "$RESET" "${SUMMARY[db_user]}"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Password" "$RESET" "${SUMMARY[db_password]}"
+    echo
   fi
   if [[ -n "${SUMMARY[admin_email]:-}" ]]; then
     printf '  %s%-22s%s %s\n' "$BOLD" "Admin email" "$RESET" "${SUMMARY[admin_email]}"
@@ -732,6 +747,37 @@ extract_app_key() {
   local f="$PELICAN_ROOT/.env"
   [[ -f "$f" ]] || return 0
   grep -E '^APP_KEY=' "$f" | head -1 | cut -d= -f2- | tr -d '\r' || true
+}
+
+# Values match the Pelican web installer “Database” step (driver / host / port).
+set_summary_db_web_installer_info() {
+  local d="${1:-mysql}"
+  case "$d" in
+    mysql)
+      SUMMARY[db_ui_driver]="MySQL"
+      SUMMARY[db_engine]="MariaDB (apt); .env DB_CONNECTION=mysql - pick MySQL in the web installer"
+      SUMMARY[db_host]="127.0.0.1"
+      SUMMARY[db_port]="3306"
+      ;;
+    pgsql)
+      SUMMARY[db_ui_driver]="PostgreSQL"
+      SUMMARY[db_engine]="PostgreSQL; .env DB_CONNECTION=pgsql"
+      SUMMARY[db_host]="127.0.0.1"
+      SUMMARY[db_port]="5432"
+      ;;
+    sqlite)
+      SUMMARY[db_ui_driver]="SQLite"
+      SUMMARY[db_engine]="SQLite file; .env DB_CONNECTION=sqlite"
+      SUMMARY[db_host]="(not used for SQLite)"
+      SUMMARY[db_port]="(not used for SQLite)"
+      ;;
+    *)
+      SUMMARY[db_ui_driver]="(see .env)"
+      SUMMARY[db_engine]=""
+      SUMMARY[db_host]=""
+      SUMMARY[db_port]=""
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -760,9 +806,6 @@ run_express() {
 
   SUMMARY[components]="$INSTALL_COMPONENTS"
   SUMMARY[os]="$OS_PRETTY"
-  SUMMARY[db_name]="$db_name"
-  SUMMARY[db_user]="$db_user"
-  SUMMARY[db_password]="$db_pass"
   SUMMARY[admin_email]="$admin_email"
   SUMMARY[admin_username]="$admin_user"
   SUMMARY[admin_password]="$admin_pass"
@@ -784,6 +827,10 @@ run_express() {
     nginx_write_site "$fqdn" 0
     SUMMARY[panel_path]="$PELICAN_ROOT"
     SUMMARY[app_key]="$(extract_app_key)"
+    SUMMARY[db_name]="$db_name"
+    SUMMARY[db_user]="$db_user"
+    SUMMARY[db_password]="$db_pass"
+    set_summary_db_web_installer_info "mysql"
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "wings" || "$INSTALL_COMPONENTS" == "both" ]]; then
@@ -852,6 +899,7 @@ run_manual() {
   SUMMARY[admin_email]="$admin_email"
   SUMMARY[admin_username]="$admin_user"
   SUMMARY[admin_password]="$admin_pass"
+  set_summary_db_web_installer_info "$db_driver"
 
   if [[ "$INSTALL_COMPONENTS" == "panel" || "$INSTALL_COMPONENTS" == "both" ]]; then
     if [[ "$webserver" != "nginx" ]]; then

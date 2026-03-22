@@ -141,14 +141,15 @@ banner() {
   echo
 }
 
-# Express: step line with ASCII progress bar; manual/other modes unchanged.
+# Express: step line with ASCII progress bar (only called from run_express).
 express_step() {
-  local cur="$1" total="$2" msg="$3"
-  if [[ "${QUIET_INSTALL:-0}" != "1" ]]; then
-    printf '%s[%sexpress%s]%s (%s/%s) %s%s\n' "$C_STEP" "$BOLD" "$RESET" "$RESET" "$cur" "$total" "$msg" "$RESET"
-    return
-  fi
-  local bar_w=14
+  local cur="${1:-1}" total="${2:-1}" msg="${3:-}"
+  local bar_w=20
+  [[ "$total" =~ ^[0-9]+$ ]] || total=1
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=1
+  [[ "$total" -lt 1 ]] && total=1
+  [[ "$cur" -lt 1 ]] && cur=1
+  [[ "$cur" -gt "$total" ]] && cur="$total"
   local filled=$(( cur * bar_w / total ))
   [[ "$cur" -ge 1 && "$filled" -lt 1 ]] && filled=1
   [[ "$cur" -eq "$total" ]] && filled=$bar_w
@@ -476,6 +477,131 @@ apply_app_url_to_dotenv() {
     sed -i.bak "s#^APP_URL=.*#APP_URL=${url}#" "$env_file" 2>/dev/null || true
   else
     echo "APP_URL=${url}" >> "$env_file"
+  fi
+}
+
+# Pelican hides /installer when APP_INSTALLED=true (see App\Livewire\Installer\PanelInstaller).
+apply_app_installed_true() {
+  local env_file="$PELICAN_ROOT/.env"
+  [[ -f "$env_file" ]] || return 0
+  if grep -q '^APP_INSTALLED=' "$env_file"; then
+    sed -i.bak 's/^APP_INSTALLED=.*/APP_INSTALLED=true/' "$env_file" 2>/dev/null || true
+  else
+    echo 'APP_INSTALLED=true' >> "$env_file"
+  fi
+}
+
+ensure_queue_connection_in_dotenv() {
+  local f="$PELICAN_ROOT/.env"
+  [[ -f "$f" ]] || return 0
+  grep -q '^QUEUE_CONNECTION=' "$f" && return 0
+  echo 'QUEUE_CONNECTION=database' >> "$f"
+}
+
+# Replaces browser installer finish: mark installed, database queue driver, systemd queue worker (p:environment:queue-service).
+panel_finalize_cli() {
+  apply_app_installed_true
+  ensure_queue_connection_in_dotenv
+  pushd "$PELICAN_ROOT" >/dev/null
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    php artisan config:clear --no-interaction -q 2>/dev/null || php artisan config:clear --no-interaction
+    if ! php artisan p:environment:queue-service --no-interaction --service-name=pelican-queue \
+      --user="$WEB_USER" --group="$WEB_USER" --overwrite >>"$EXPRESS_LOG" 2>&1; then
+      warn "Queue worker systemd step failed (see log or run: cd ${PELICAN_ROOT} && php artisan p:environment:queue-service)"
+    fi
+    php artisan config:clear --no-interaction -q 2>/dev/null || true
+  else
+    php artisan config:clear --no-interaction
+    if ! php artisan p:environment:queue-service --no-interaction --service-name=pelican-queue \
+      --user="$WEB_USER" --group="$WEB_USER" --overwrite; then
+      warn "Queue worker systemd step failed; from ${PELICAN_ROOT} run: php artisan p:environment:queue-service"
+    fi
+    php artisan config:clear --no-interaction
+  fi
+  popd >/dev/null
+}
+
+# Panel + Wings on same host: p:node:make + p:node:configuration → /etc/pelican/config.yml, then start wings.
+# $1 = panel base URL (APP_URL), $2 = Nginx server_name / primary host (for wings subdomain when HTTPS + domain).
+pelican_autoconfigure_wings_local() {
+  local panel_base="$1" server_name="$2"
+  local wings_host scheme="http"
+
+  if [[ "$panel_base" == https://* ]] && ! [[ "$server_name" =~ ^[0-9.]+$ ]]; then
+    wings_host="wings.${server_name}"
+  else
+    wings_host="wings.localhost"
+  fi
+
+  if [[ "$panel_base" == https://* && "$wings_host" != "wings.localhost" ]]; then
+    scheme="https"
+  fi
+
+  if ! grep -qE "[[:space:]]${wings_host}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+    echo "127.0.0.1   ${wings_host}" >> /etc/hosts
+    info "Added ${wings_host} to /etc/hosts (Pelican rejects 127.0.0.1/localhost as node FQDN)."
+  fi
+
+  pushd "$PELICAN_ROOT" >/dev/null
+  local node_count
+  node_count=$(php artisan p:node:list --format=json --no-interaction 2>/dev/null | php -r '$a=json_decode(stream_get_contents(STDIN),true); echo is_array($a) ? count($a) : 0;' 2>/dev/null || echo "0")
+  node_count=$(printf '%s' "$node_count" | tr -d '\r\n')
+
+  if [[ "${node_count:-0}" -eq 0 ]]; then
+    if ! php artisan p:node:make --no-interaction \
+      --name="This server" \
+      --description="Created by Pelican install.sh" \
+      --fqdn="$wings_host" \
+      --scheme="$scheme" \
+      --public=1 \
+      --proxy=0 \
+      --maintenance=0 \
+      --maxMemory=0 \
+      --overallocateMemory=-1 \
+      --maxDisk=0 \
+      --overallocateDisk=-1 \
+      --maxCpu=0 \
+      --overallocateCpu=-1 \
+      --uploadSize=256 \
+      --daemonListeningPort=8080 \
+      --daemonConnectingPort=8080 \
+      --daemonSFTPPort=2022 \
+      --daemonSFTPAlias= \
+      --daemonBase=/var/lib/pelican/volumes; then
+      popd >/dev/null
+      warn "p:node:make failed — create the node in the Panel, then: cd ${PELICAN_ROOT} && php artisan p:node:configuration <id> --format=yaml > /etc/pelican/config.yml"
+      return 1
+    fi
+  else
+    info "Panel already has ${node_count} node(s); skipping p:node:make (writing YAML for latest node id)."
+  fi
+
+  local nid
+  nid=$(php artisan p:node:list --format=json --no-interaction 2>/dev/null | php -r '$a=json_decode(stream_get_contents(STDIN),true); if(!is_array($a)||!$a){exit(1);}$m=0;foreach($a as $n){if(!empty($n["id"])&&(int)$n["id"]>$m)$m=(int)$n["id"];}if($m<1)exit(1);echo $m;' 2>/dev/null) || nid=""
+  nid=$(printf '%s' "$nid" | tr -d '\r\n ')
+  popd >/dev/null
+
+  if [[ -z "$nid" || "$nid" == "0" ]]; then
+    warn "Could not determine node id from the Panel database."
+    return 1
+  fi
+
+  mkdir -p /etc/pelican
+  if ! ( cd "$PELICAN_ROOT" && php artisan p:node:configuration "$nid" --format=yaml --no-interaction > /etc/pelican/config.yml ); then
+    warn "Failed to write /etc/pelican/config.yml"
+    return 1
+  fi
+
+  SUMMARY[wings_config_written]="yes"
+  SUMMARY[node_id]="$nid"
+  info "Wrote /etc/pelican/config.yml for node id ${nid} (daemon FQDN ${wings_host}, scheme ${scheme})."
+  if [[ "$scheme" == "https" ]]; then
+    muted "If Wings fails to bind TLS, add certificates under /etc/letsencrypt/live/${wings_host}/ or switch the node to HTTP in the Panel."
+  fi
+  if systemctl start wings 2>/dev/null; then
+    info "wings.service started."
+  else
+    warn "systemctl start wings failed — check: journalctl -u wings -n 50"
   fi
 }
 
@@ -913,9 +1039,8 @@ print_summary() {
 
   if [[ -n "${SUMMARY[panel_url]:-}" && ( "${SUMMARY[components]:-}" == "panel" || "${SUMMARY[components]:-}" == "both" ) ]]; then
     echo
-    printf '  %s%s%s\n' "$C_HEAD" "  Log in to the Panel (same as above if you already saw the banner)" "$RESET"
+    printf '  %s%s%s\n' "$C_HEAD" "  Log in to the Panel" "$RESET"
     printf '  %s%-22s%s %s\n' "$BOLD" "  Panel URL" "$RESET" "${SUMMARY[panel_url]}"
-    printf '  %s%-22s%s %s\n' "$BOLD" "  Web installer" "$RESET" "${SUMMARY[panel_url]}/installer"
     if [[ -n "${SUMMARY[admin_email]:-}" ]]; then
       printf '  %s%-22s%s %s\n' "$BOLD" "  Admin email" "$RESET" "${SUMMARY[admin_email]}"
       printf '  %s%-22s%s %s\n' "$BOLD" "  Admin username" "$RESET" "${SUMMARY[admin_username]}"
@@ -925,7 +1050,7 @@ print_summary() {
   fi
 
   if [[ -n "${SUMMARY[db_name]:-}" ]]; then
-    printf '  %s%s%s\n' "$C_HEAD" "  Web installer — Database step (same values if you finish setup in the browser)" "$RESET"
+    printf '  %s%s%s\n' "$C_HEAD" "  Database (.env)" "$RESET"
     if [[ -n "${SUMMARY[db_ui_driver]:-}" ]]; then
       printf '  %s%-22s%s %s\n' "$BOLD" "  Driver (dropdown)" "$RESET" "${SUMMARY[db_ui_driver]}"
     fi
@@ -959,16 +1084,19 @@ print_summary() {
   fi
   if [[ "${SUMMARY[wings_installed]:-}" == "yes" ]]; then
     echo
-    printf '  %s%s%s\n' "$C_HEAD" "  Wings — this is normal: no node appears until you create it in the Panel" "$RESET"
+    printf '  %s%s%s\n' "$C_HEAD" "  Wings" "$RESET"
     printf '  %s%-22s%s %s\n' "$BOLD" "  Installed on disk" "$RESET" "Docker, /usr/local/bin/wings, systemd unit wings.service (enabled)"
-    printf '  %s%-22s%s %s\n' "$BOLD" "  Not installed by script" "$RESET" "A Panel node (metadata + token + config YAML) — Pelican requires that from the UI"
-    printf '  %s%-22s%s %s\n' "$BOLD" "  Config file" "$RESET" "/etc/pelican/config.yml (empty until you paste YAML from the Panel)"
-    echo
-    printf '  %s  Next steps:%s\n' "$BOLD" "$RESET"
-    printf '    %s1.%s In the Panel go to %sAdmin -> Nodes -> Create New%s, fill FQDN/port, save.\n' "$DIM" "$RESET" "$BOLD" "$RESET"
-    printf '    %s2.%s Open the node -> %sConfiguration%s tab -> copy the YAML (or use Auto Deploy).\n' "$DIM" "$RESET" "$BOLD" "$RESET"
-    printf '    %s3.%s Put it in %s/etc/pelican/config.yml%s then: %ssudo systemctl start wings%s\n' "$DIM" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET"
-    printf '    %s4.%s If the Panel uses HTTPS, Wings must use TLS too (see Pelican SSL docs).\n' "$DIM" "$RESET"
+    if [[ "${SUMMARY[wings_config_written]:-}" == "yes" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Config" "$RESET" "/etc/pelican/config.yml (from p:node:configuration)"
+      [[ -n "${SUMMARY[node_id]:-}" ]] && printf '  %s%-22s%s %s\n' "$BOLD" "  Panel node id" "$RESET" "${SUMMARY[node_id]}"
+    else
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Config" "$RESET" "/etc/pelican/config.yml — create a node in the Panel, then: php artisan p:node:configuration <id> --format=yaml > /etc/pelican/config.yml"
+      echo
+      printf '  %s  Next steps:%s\n' "$BOLD" "$RESET"
+      printf '    %s1.%s In the Panel: %sAdmin → Nodes → Create New%s (FQDN cannot be 127.0.0.1).\n' "$DIM" "$RESET" "$BOLD" "$RESET"
+      printf '    %s2.%s %sphp artisan p:node:configuration <id> --format=yaml > /etc/pelican/config.yml%s\n' "$DIM" "$RESET" "$BOLD" "$RESET"
+      printf '    %s3.%s %ssudo systemctl start wings%s\n' "$DIM" "$RESET" "$BOLD" "$RESET"
+    fi
     echo
     muted "  Docs: https://pelican.dev/docs/wings/install"
   fi
@@ -983,13 +1111,13 @@ extract_app_key() {
   grep -E '^APP_KEY=' "$f" | head -1 | cut -d= -f2- | tr -d '\r' || true
 }
 
-# Values match the Pelican web installer “Database” step (driver / host / port).
+# Database values written to .env (same as a manual Pelican DB setup).
 set_summary_db_web_installer_info() {
   local d="${1:-mysql}"
   case "$d" in
     mysql)
       SUMMARY[db_ui_driver]="MySQL"
-      SUMMARY[db_engine]="MariaDB (apt); .env DB_CONNECTION=mysql - pick MySQL in the web installer"
+      SUMMARY[db_engine]="MariaDB (apt); .env DB_CONNECTION=mysql"
       SUMMARY[db_host]="127.0.0.1"
       SUMMARY[db_port]="3306"
       ;;
@@ -1014,21 +1142,17 @@ set_summary_db_web_installer_info() {
   esac
 }
 
-# Shown as soon as the Panel responds. Uses SUMMARY (filled before call): URLs, DB, admin, APP_KEY.
-print_panel_login_banner() {
+# Shown after CLI finalization: no /installer wizard — APP_INSTALLED=true, queue worker, cron already set.
+print_panel_ready_banner() {
   local panel_url="${SUMMARY[panel_url]:-}"
-  section "Panel is ready — log in & web installer values"
+  section "Panel is ready — CLI setup complete"
   echo
   printf '  %s%-22s%s %s\n' "$BOLD" "Panel URL" "$RESET" "$panel_url"
-  if [[ "$panel_url" == http://* || "$panel_url" == https://* ]]; then
-    printf '  %s%-22s%s %s\n' "$BOLD" "Web installer URL" "$RESET" "${panel_url}/installer"
-  else
-    printf '  %s%-22s%s %s\n' "$BOLD" "Web installer URL" "$RESET" "(open Panel URL above, path /installer)"
-  fi
+  muted "The web installer at /installer is disabled (APP_INSTALLED=true). Log in with the admin account below."
   echo
 
   if [[ -n "${SUMMARY[db_name]:-}" ]]; then
-    printf '  %s%s%s\n' "$C_HEAD" "  Web installer — Database (same fields as the browser form)" "$RESET"
+    printf '  %s%s%s\n' "$C_HEAD" "  Database (.env)" "$RESET"
     if [[ -n "${SUMMARY[db_ui_driver]:-}" ]]; then
       printf '  %s%-22s%s %s\n' "$BOLD" "  Driver (dropdown)" "$RESET" "${SUMMARY[db_ui_driver]}"
     fi
@@ -1056,55 +1180,7 @@ print_panel_login_banner() {
     printf '  %s%-22s%s %s\n' "$BOLD" "APP_KEY (backup)" "$RESET" "${SUMMARY[app_key]}"
   fi
   echo
-  muted "The database and admin user are already created; use the values above if the web installer asks for them."
-  echo
-}
-
-# Pelican's browser installer shows two shell commands (cron / queue / etc.) that differ per install.
-# Drop to a real subshell so the user can paste them without the main script blocking the terminal.
-web_installer_terminal_commands_shell() {
-  local after="${1:-summary}" # "wings" = Panel+Wings path; "summary" = Panel-only path
-  section "Web installer — two terminal commands"
-  echo
-  printf '%s%s%s\n' "$C_HEAD" "Later steps in the browser installer will show two commands to run on this server." "$RESET"
-  muted "They are built from your paths and must be copied from the browser — this script cannot guess them."
-  echo
-  printf '  %s%-20s%s %s\n' "$BOLD" "Panel directory" "$RESET" "$PELICAN_ROOT"
-  echo
-  printf '%sWhat to do:%s\n' "$BOLD" "$RESET"
-  echo "  1. In the browser, continue the web installer until it shows two shell commands."
-  echo "  2. Press Enter here to open a subshell on this same machine (still root if you used sudo)."
-  echo "  3. Paste and run each command from the browser (one at a time). Wait for each to finish."
-  echo "  4. When both are done, type:  exit"
-  echo
-  if [[ "$after" == "wings" ]]; then
-    muted "After you type exit, you will be asked whether to continue with Docker + Wings on this server."
-  else
-    muted "After you type exit, the installer will print the final summary."
-  fi
-  echo
-  printf '%s>%s %s\n' "$C_ACCENT" "$RESET" "Press Enter to open the subshell…" >&2
-  read_tty -r _
-  echo
-  printf '%s==== subshell: paste installer commands, then type exit ====%s\n' "$C_HEAD" "$RESET"
-  printf '%scd %q  # use if a command needs to run from the panel folder%s\n' "$DIM" "$PELICAN_ROOT" "$RESET"
-  echo
-  local _prev
-  _prev=$(pwd 2>/dev/null || true)
-  cd "$PELICAN_ROOT" 2>/dev/null || true
-  # Use controlling terminal so paste works even when script stdin is a pipe (curl | bash).
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    bash --noprofile --norc -i </dev/tty >/dev/tty 2>&1 || bash -i </dev/tty >/dev/tty 2>&1
-  elif [[ -t 0 && -t 1 ]]; then
-    bash --noprofile --norc -i 2>/dev/null || bash -i
-  else
-    warn "No usable terminal; open another SSH session, run the two browser commands there, then continue here."
-    printf '%s>%s %s\n' "$C_ACCENT" "$RESET" "Press Enter after you have run both commands…" >&2
-    read_tty -r _
-  fi
-  [[ -n "$_prev" ]] && cd "$_prev" 2>/dev/null || true
-  echo
-  printf '%s==== back to Pelican installer script ====%s\n' "$C_HEAD" "$RESET"
+  muted "Queue worker: systemd unit pelican-queue (if enabled). Cron: www-data schedule:run every minute."
   echo
 }
 
@@ -1112,7 +1188,7 @@ web_installer_terminal_commands_shell() {
 pause_before_wings_install() {
   echo
   printf '%s%s%s\n' "$C_HEAD" "Docker + Wings on this server" "$RESET"
-  muted "You can create the node in the Panel (Admin → Nodes) after Docker/Wings binaries exist, or finish the web installer first."
+  muted "For Panel + Wings, the script can create a local node and write /etc/pelican/config.yml after Docker is installed."
   echo
   if confirm "Continue and install Docker + Wings on this machine now?" "y"; then
     return 0
@@ -1120,25 +1196,6 @@ pause_before_wings_install() {
   SUMMARY[wings_skipped]="yes"
   warn "Skipping Docker/Wings. Install them later: https://pelican.dev/docs/wings/install"
   return 1
-}
-
-# Shown when installing Panel + Wings: Panel must be ready first; explains remote / APP_URL.
-wings_setup_guidance() {
-  local panel_base="$1"
-  section "Wings setup (do this in the Panel)"
-  info "The Wings config field \"remote\" must match how the Panel is reached (same as APP_URL in .env)."
-  printf '  %s%-20s%s %s\n' "$BOLD" "Set APP_URL to" "$RESET" "${panel_base}"
-  muted "If you open the Panel in the browser as http://192.168.x.x, that exact base URL must be APP_URL and Wings \"remote\"."
-  echo
-  info "1) Log into the Panel → Admin → Nodes → Create New."
-  info "2) Domain: e.g. wings.localhost — on this server add to /etc/hosts:"
-  printf '     %s%s%s\n' "$BOLD" "127.0.0.1   wings.localhost" "$RESET"
-  info "3) Port 8080, SSL: HTTP (unless you use HTTPS everywhere)."
-  info "4) Save the node → Configuration → copy YAML to /etc/pelican/config.yml (or Auto Deploy)."
-  info "5) Check \"remote:\" in that YAML equals: ${panel_base}"
-  info "6) Then: sudo systemctl start wings"
-  muted "If YAML lists ssl.cert paths but api.ssl.enabled is false, Wings ignores those paths until you enable HTTPS."
-  echo
 }
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1242,10 @@ run_express() {
     wings_systemd
   }
 
+  _express_wings_autoconfig() {
+    pelican_autoconfigure_wings_local "${SUMMARY[panel_url]}" "$fqdn"
+  }
+
   if [[ "$INSTALL_COMPONENTS" == "panel" || "$INSTALL_COMPONENTS" == "both" ]]; then
     section "Step 1 — Pelican Panel"
     local etotal=4
@@ -1217,6 +1278,8 @@ run_express() {
     express_step 4 "$etotal" "Environment, migrations, admin, Nginx, APP_URL…"
     express_run "Artisan, migrations, admin, nginx, APP_URL…" _express_panel_step4
 
+    panel_finalize_cli
+
     SUMMARY[panel_path]="$PELICAN_ROOT"
     SUMMARY[app_key]="$(extract_app_key)"
     SUMMARY[db_name]="$db_name"
@@ -1226,22 +1289,22 @@ run_express() {
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "panel" ]]; then
-    print_panel_login_banner
-    web_installer_terminal_commands_shell "summary"
+    print_panel_ready_banner
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
-    print_panel_login_banner
-    web_installer_terminal_commands_shell "wings"
-    wings_setup_guidance "http://${fqdn}"
+    print_panel_ready_banner
     if pause_before_wings_install; then
       section "Step 2 — Docker + Wings"
-      express_step 1 2 "Docker Engine…"
+      express_step 1 3 "Docker Engine…"
       express_run "Docker CE (get.docker.com, may take a few minutes)…" install_docker
-      express_step 2 2 "Wings binary + systemd unit…"
+      express_step 2 3 "Wings binary + systemd unit…"
       express_run "Wings binary & systemd unit…" _express_wings_bin_systemd
+      express_step 3 3 "Panel node + Wings config + start…"
+      if ! express_run "p:node:make, config.yml, wings.service…" _express_wings_autoconfig; then
+        warn "Wings auto-config failed — create the node in the Panel and write /etc/pelican/config.yml manually (see summary)."
+      fi
       SUMMARY[wings_installed]="yes"
-      info "After /etc/pelican/config.yml is in place: sudo systemctl start wings"
     fi
   fi
 
@@ -1252,7 +1315,7 @@ run_express() {
     express_step 2 2 "Wings binary + systemd unit…"
     express_run "Wings binary & systemd unit…" _express_wings_bin_systemd
     SUMMARY[wings_installed]="yes"
-    info "Create the node in the Panel, then: sudo systemctl start wings"
+    info "Wings only: create a node on your Panel host, then run there: php artisan p:node:configuration <id> --format=yaml > /etc/pelican/config.yml && systemctl start wings"
   fi
 
   print_summary
@@ -1396,12 +1459,13 @@ run_manual() {
     }
     ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
 
+    panel_finalize_cli
+
     SUMMARY[app_key]="$(extract_app_key)"
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "panel" ]]; then
-    print_panel_login_banner
-    web_installer_terminal_commands_shell "summary"
+    print_panel_ready_banner
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
@@ -1409,16 +1473,14 @@ run_manual() {
     if [[ ! "$gurl" == http://* && ! "$gurl" == https://* ]]; then
       gurl="http://${fqdn}"
     fi
-    print_panel_login_banner
-    web_installer_terminal_commands_shell "wings"
-    wings_setup_guidance "$gurl"
+    print_panel_ready_banner
     if pause_before_wings_install; then
       section "Step 2 — Docker + Wings"
       install_docker
       install_wings_binary
       wings_systemd
+      pelican_autoconfigure_wings_local "$gurl" "$fqdn" || true
       SUMMARY[wings_installed]="yes"
-      info "After /etc/pelican/config.yml is in place: sudo systemctl start wings"
     fi
   fi
 
@@ -1428,7 +1490,7 @@ run_manual() {
     install_wings_binary
     wings_systemd
     SUMMARY[wings_installed]="yes"
-    info "After /etc/pelican/config.yml is in place: sudo systemctl start wings"
+    info "Wings only: create a node on your Panel host, then run there: php artisan p:node:configuration <id> --format=yaml > /etc/pelican/config.yml && systemctl start wings"
   fi
 
   print_summary

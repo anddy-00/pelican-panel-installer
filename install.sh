@@ -93,6 +93,8 @@ readonly BANNER_BOX_WIDTH=68
 
 hr() {
   local w; w=$(ui_width)
+  # Ultra-wide terminals make section rules unreadably long
+  [[ "$w" -gt 78 ]] && w=78
   printf '%*s\n' "$w" '' | tr ' ' '-'
 }
 
@@ -139,10 +141,70 @@ banner() {
   echo
 }
 
-# Express: one status line per phase (no wall of tar/composer output)
+# Express: step line with ASCII progress bar; manual/other modes unchanged.
 express_step() {
   local cur="$1" total="$2" msg="$3"
-  printf '%s[%sexpress%s]%s (%s/%s) %s%s\n' "$C_STEP" "$BOLD" "$RESET" "$RESET" "$cur" "$total" "$msg" "$RESET"
+  if [[ "${QUIET_INSTALL:-0}" != "1" ]]; then
+    printf '%s[%sexpress%s]%s (%s/%s) %s%s\n' "$C_STEP" "$BOLD" "$RESET" "$RESET" "$cur" "$total" "$msg" "$RESET"
+    return
+  fi
+  local bar_w=14
+  local filled=$(( cur * bar_w / total ))
+  [[ "$cur" -ge 1 && "$filled" -lt 1 ]] && filled=1
+  [[ "$cur" -eq "$total" ]] && filled=$bar_w
+  local empty=$(( bar_w - filled ))
+  local bar="" i
+  for ((i = 0; i < filled; i++)); do bar+="#"; done
+  for ((i = 0; i < empty; i++)); do bar+="."; done
+  local pct=$(( cur * 100 / total ))
+  printf '%s[%sexpress%s]%s %s/%s [%s] %3d%%  %s%s\n' \
+    "$C_STEP" "$BOLD" "$RESET" "$RESET" "$cur" "$total" "$bar" "$pct" "$msg" "$RESET"
+}
+
+# Express only: background spinner on stderr while a slow command runs (apt, composer, …).
+EXPRESS_SPIN_PID=""
+
+express_spin_start() {
+  local label="${1:-Working}"
+  [[ "${QUIET_INSTALL:-0}" != "1" ]] && return 0
+  printf '\n' >&2
+  (
+    local spin='|/-+' # 4 ASCII chars (avoid \ in quotes)
+    local i=0
+    while true; do
+      printf '\r  %s%s %s%s…%s' "$C_STEP" "${spin:$i:1}" "$BOLD" "$label" "$RESET" >&2
+      i=$(((i + 1) % 4))
+      sleep 0.12
+    done
+  ) &
+  EXPRESS_SPIN_PID=$!
+}
+
+express_spin_stop() {
+  [[ "${QUIET_INSTALL:-0}" != "1" ]] && return 0
+  if [[ -n "${EXPRESS_SPIN_PID:-}" ]] && kill -0 "$EXPRESS_SPIN_PID" 2>/dev/null; then
+    kill "$EXPRESS_SPIN_PID" 2>/dev/null || true
+    wait "$EXPRESS_SPIN_PID" 2>/dev/null || true
+  fi
+  EXPRESS_SPIN_PID=""
+  printf '\r\033[K' >&2
+}
+
+# Express: run a command/function with spinner (stderr only; does not affect stdout captures).
+express_run() {
+  local label="$1"
+  shift
+  if [[ "${QUIET_INSTALL:-0}" != "1" ]]; then
+    "$@"
+    return $?
+  fi
+  express_spin_start "$label"
+  set +e
+  "$@"
+  local ec=$?
+  set -e
+  express_spin_stop
+  return "$ec"
 }
 
 section() {
@@ -889,6 +951,12 @@ print_summary() {
   if [[ -n "${SUMMARY[app_key]:-}" ]]; then
     printf '  %s%-22s%s %s\n' "$BOLD" "APP_KEY (backup!)" "$RESET" "${SUMMARY[app_key]}"
   fi
+  if [[ "${SUMMARY[wings_skipped]:-}" == "yes" ]]; then
+    echo
+    printf '  %s%s%s\n' "$C_HEAD" "  Docker + Wings" "$RESET"
+    muted "  Skipped at your prompt. Install later: https://pelican.dev/docs/wings/install"
+    echo
+  fi
   if [[ "${SUMMARY[wings_installed]:-}" == "yes" ]]; then
     echo
     printf '  %s%s%s\n' "$C_HEAD" "  Wings — this is normal: no node appears until you create it in the Panel" "$RESET"
@@ -992,14 +1060,66 @@ print_panel_login_banner() {
   echo
 }
 
-pause_before_wings_install() {
+# Pelican's browser installer shows two shell commands (cron / queue / etc.) that differ per install.
+# Drop to a real subshell so the user can paste them without the main script blocking the terminal.
+web_installer_terminal_commands_shell() {
+  local after="${1:-summary}" # "wings" = Panel+Wings path; "summary" = Panel-only path
+  section "Web installer — two terminal commands"
   echo
-  printf '%s%s%s\n' "$C_HEAD" "When you are ready, this script will install Docker and the Wings binary on this server." "$RESET"
-  muted "Tip: open the Panel in your browser, go to Admin -> Nodes -> Create New, then use Configuration / Auto Deploy for Wings after binaries are installed."
+  printf '%s%s%s\n' "$C_HEAD" "Later steps in the browser installer will show two commands to run on this server." "$RESET"
+  muted "They are built from your paths and must be copied from the browser — this script cannot guess them."
   echo
-  printf '%s>%s %s\n' "$C_ACCENT" "$RESET" "Press Enter to continue with Docker + Wings installation…" >&2
+  printf '  %s%-20s%s %s\n' "$BOLD" "Panel directory" "$RESET" "$PELICAN_ROOT"
+  echo
+  printf '%sWhat to do:%s\n' "$BOLD" "$RESET"
+  echo "  1. In the browser, continue the web installer until it shows two shell commands."
+  echo "  2. Press Enter here to open a subshell on this same machine (still root if you used sudo)."
+  echo "  3. Paste and run each command from the browser (one at a time). Wait for each to finish."
+  echo "  4. When both are done, type:  exit"
+  echo
+  if [[ "$after" == "wings" ]]; then
+    muted "After you type exit, you will be asked whether to continue with Docker + Wings on this server."
+  else
+    muted "After you type exit, the installer will print the final summary."
+  fi
+  echo
+  printf '%s>%s %s\n' "$C_ACCENT" "$RESET" "Press Enter to open the subshell…" >&2
   read_tty -r _
   echo
+  printf '%s==== subshell: paste installer commands, then type exit ====%s\n' "$C_HEAD" "$RESET"
+  printf '%scd %q  # use if a command needs to run from the panel folder%s\n' "$DIM" "$PELICAN_ROOT" "$RESET"
+  echo
+  local _prev
+  _prev=$(pwd 2>/dev/null || true)
+  cd "$PELICAN_ROOT" 2>/dev/null || true
+  # Use controlling terminal so paste works even when script stdin is a pipe (curl | bash).
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    bash --noprofile --norc -i </dev/tty >/dev/tty 2>&1 || bash -i </dev/tty >/dev/tty 2>&1
+  elif [[ -t 0 && -t 1 ]]; then
+    bash --noprofile --norc -i 2>/dev/null || bash -i
+  else
+    warn "No usable terminal; open another SSH session, run the two browser commands there, then continue here."
+    printf '%s>%s %s\n' "$C_ACCENT" "$RESET" "Press Enter after you have run both commands…" >&2
+    read_tty -r _
+  fi
+  [[ -n "$_prev" ]] && cd "$_prev" 2>/dev/null || true
+  echo
+  printf '%s==== back to Pelican installer script ====%s\n' "$C_HEAD" "$RESET"
+  echo
+}
+
+# Returns 0 if user wants Wings install to proceed, 1 if they skip (Panel + Wings only).
+pause_before_wings_install() {
+  echo
+  printf '%s%s%s\n' "$C_HEAD" "Docker + Wings on this server" "$RESET"
+  muted "You can create the node in the Panel (Admin → Nodes) after Docker/Wings binaries exist, or finish the web installer first."
+  echo
+  if confirm "Continue and install Docker + Wings on this machine now?" "y"; then
+    return 0
+  fi
+  SUMMARY[wings_skipped]="yes"
+  warn "Skipping Docker/Wings. Install them later: https://pelican.dev/docs/wings/install"
+  return 1
 }
 
 # Shown when installing Panel + Wings: Panel must be ready first; explains remote / APP_URL.
@@ -1060,29 +1180,43 @@ run_express() {
   SUMMARY[admin_username]="$admin_user"
   SUMMARY[admin_password]="$admin_pass"
 
+  _express_wings_bin_systemd() {
+    install_wings_binary
+    wings_systemd
+  }
+
   if [[ "$INSTALL_COMPONENTS" == "panel" || "$INSTALL_COMPONENTS" == "both" ]]; then
     section "Step 1 — Pelican Panel"
     local etotal=4
+
+    _express_panel_step4() {
+      configure_panel_env "$db_name" "$db_user" "$db_pass"
+      create_admin_user "$admin_email" "$admin_user" "$admin_pass"
+      panel_permissions
+      setup_cron
+      nginx_write_site "$fqdn" 0
+      apply_app_url_to_dotenv "http://${fqdn}"
+      if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+        ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction -q 2>/dev/null ) || \
+          ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
+      else
+        ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
+      fi
+    }
+
     express_step 1 "$etotal" "System packages (nginx, MariaDB, PHP)…"
     select_php_version
-    apt_install_panel_deps
+    express_run "APT: nginx, MariaDB, PHP (may take a few minutes)…" apt_install_panel_deps
+
     express_step 2 "$etotal" "Creating database and MySQL user…"
-    create_database_and_user "$db_name" "$db_user" "$db_pass"
+    express_run "MariaDB: creating database & user…" create_database_and_user "$db_name" "$db_user" "$db_pass"
+
     express_step 3 "$etotal" "Panel release + Composer (this can take several minutes)…"
-    install_panel_files
-    express_step 4 "$etotal" "Environment, migrations, admin account, Nginx, APP_URL…"
-    configure_panel_env "$db_name" "$db_user" "$db_pass"
-    create_admin_user "$admin_email" "$admin_user" "$admin_pass"
-    panel_permissions
-    setup_cron
-    nginx_write_site "$fqdn" 0
-    apply_app_url_to_dotenv "http://${fqdn}"
-    if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
-      ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction -q 2>/dev/null ) || \
-        ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
-    else
-      ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
-    fi
+    express_run "Download, extract & composer install…" install_panel_files
+
+    express_step 4 "$etotal" "Environment, migrations, admin, Nginx, APP_URL…"
+    express_run "Artisan, migrations, admin, nginx, APP_URL…" _express_panel_step4
+
     SUMMARY[panel_path]="$PELICAN_ROOT"
     SUMMARY[app_key]="$(extract_app_key)"
     SUMMARY[db_name]="$db_name"
@@ -1093,29 +1227,30 @@ run_express() {
 
   if [[ "$INSTALL_COMPONENTS" == "panel" ]]; then
     print_panel_login_banner
+    web_installer_terminal_commands_shell "summary"
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
     print_panel_login_banner
+    web_installer_terminal_commands_shell "wings"
     wings_setup_guidance "http://${fqdn}"
-    pause_before_wings_install
-    section "Step 2 — Docker + Wings"
-    express_step 1 2 "Docker Engine…"
-    install_docker
-    express_step 2 2 "Wings binary + systemd unit…"
-    install_wings_binary
-    wings_systemd
-    SUMMARY[wings_installed]="yes"
-    info "After /etc/pelican/config.yml is in place: sudo systemctl start wings"
+    if pause_before_wings_install; then
+      section "Step 2 — Docker + Wings"
+      express_step 1 2 "Docker Engine…"
+      express_run "Docker CE (get.docker.com, may take a few minutes)…" install_docker
+      express_step 2 2 "Wings binary + systemd unit…"
+      express_run "Wings binary & systemd unit…" _express_wings_bin_systemd
+      SUMMARY[wings_installed]="yes"
+      info "After /etc/pelican/config.yml is in place: sudo systemctl start wings"
+    fi
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "wings" ]]; then
     section "Wings only — Docker + Wings"
     express_step 1 2 "Docker Engine…"
-    install_docker
+    express_run "Docker CE (get.docker.com, may take a few minutes)…" install_docker
     express_step 2 2 "Wings binary + systemd unit…"
-    install_wings_binary
-    wings_systemd
+    express_run "Wings binary & systemd unit…" _express_wings_bin_systemd
     SUMMARY[wings_installed]="yes"
     info "Create the node in the Panel, then: sudo systemctl start wings"
   fi
@@ -1264,24 +1399,31 @@ run_manual() {
     SUMMARY[app_key]="$(extract_app_key)"
   fi
 
-  if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
-    {
-      local gurl="${SUMMARY[panel_url]}"
-      if [[ ! "$gurl" == http://* && ! "$gurl" == https://* ]]; then
-        gurl="http://${fqdn}"
-      fi
-      print_panel_login_banner
-      wings_setup_guidance "$gurl"
-      pause_before_wings_install
-    }
+  if [[ "$INSTALL_COMPONENTS" == "panel" ]]; then
+    print_panel_login_banner
+    web_installer_terminal_commands_shell "summary"
   fi
 
-  if [[ "$INSTALL_COMPONENTS" == "wings" || "$INSTALL_COMPONENTS" == "both" ]]; then
-    if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
-      section "Step 2 — Docker + Wings"
-    else
-      section "Wings only — Docker + Wings"
+  if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
+    local gurl="${SUMMARY[panel_url]}"
+    if [[ ! "$gurl" == http://* && ! "$gurl" == https://* ]]; then
+      gurl="http://${fqdn}"
     fi
+    print_panel_login_banner
+    web_installer_terminal_commands_shell "wings"
+    wings_setup_guidance "$gurl"
+    if pause_before_wings_install; then
+      section "Step 2 — Docker + Wings"
+      install_docker
+      install_wings_binary
+      wings_systemd
+      SUMMARY[wings_installed]="yes"
+      info "After /etc/pelican/config.yml is in place: sudo systemctl start wings"
+    fi
+  fi
+
+  if [[ "$INSTALL_COMPONENTS" == "wings" ]]; then
+    section "Wings only — Docker + Wings"
     install_docker
     install_wings_binary
     wings_systemd
@@ -1298,6 +1440,8 @@ run_manual() {
 main() {
   require_root
   detect_environment
+  # Clean slate for the installer UI (MOTD / scrollback stays above if you scroll up).
+  [[ -t 1 ]] && clear
   intro_before_ui
   banner
   os_warning_block

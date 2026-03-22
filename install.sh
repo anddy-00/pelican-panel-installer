@@ -56,45 +56,86 @@ fi
 QUIET_INSTALL="${QUIET_INSTALL:-0}"
 EXPRESS_LOG="${EXPRESS_LOG:-/tmp/pelican-install.log}"
 
+# Express: hide apt/dpkg/systemctl noise; full output is in EXPRESS_LOG on failure.
+run_apt_quiet() {
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    {
+      echo "---- apt: $* ----"
+      date -Iseconds 2>/dev/null || date
+    } >>"$EXPRESS_LOG"
+    if ! env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none "$@" >>"$EXPRESS_LOG" 2>&1; then
+      error "Package step failed: $*"
+      tail -n 60 "$EXPRESS_LOG" >&2
+      exit 1
+    fi
+  else
+    env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none "$@"
+  fi
+}
+
+run_cmd_quiet() {
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    echo "---- cmd: $* ----" >>"$EXPRESS_LOG"
+    if ! "$@" >>"$EXPRESS_LOG" 2>&1; then
+      error "Command failed: $*"
+      tail -n 40 "$EXPRESS_LOG" >&2
+      exit 1
+    fi
+  else
+    "$@"
+  fi
+}
+
 ui_width() { echo "${COLUMNS:-80}"; }
+
+# Fixed width so the banner stays aligned (full $COLUMNS caused huge empty rails).
+readonly BANNER_BOX_WIDTH=68
 
 hr() {
   local w; w=$(ui_width)
   printf '%*s\n' "$w" '' | tr ' ' '-'
 }
 
-# ASCII-only frame (UTF-8 box chars break on some SSH/console fonts)
-box_top() {
-  local w=$(( $(ui_width) - 2 ))
+# Banner frame: plain text only inside rows — ANSI in the string breaks padding (${#text}).
+banner_rule() {
+  local w=$(( BANNER_BOX_WIDTH - 2 ))
   printf '%s+' "$C_ACCENT"
   printf '%*s' "$w" '' | tr ' ' '='
   printf '+%s\n' "$RESET"
 }
 
-box_bottom() {
-  local w=$(( $(ui_width) - 2 ))
-  printf '%s+' "$C_ACCENT"
-  printf '%*s' "$w" '' | tr ' ' '='
-  printf '+%s\n' "$RESET"
-}
-
-box_line() {
+banner_row() {
   local text="$1"
-  local pad=$(( $(ui_width) - 4 - ${#text} ))
-  [[ $pad -lt 0 ]] && pad=0
+  local inner=$(( BANNER_BOX_WIDTH - 4 ))
+  local len=${#text}
+  if [[ $len -gt $inner ]]; then
+    text="${text:0:$inner}"
+    len=$inner
+  fi
+  local pad=$(( inner - len ))
   printf '%s| %s%*s%s |%s\n' "$C_ACCENT" "$BOLD$text$RESET" "$pad" '' '' "$RESET"
+}
+
+# Plain-language context before the framed header (so the UI is not abrupt).
+intro_before_ui() {
+  echo
+  printf '%sPelican Panel & Wings installer%s  %s%s%s\n' "$BOLD" "$RESET" "$DIM" "v${SCRIPT_VERSION}" "$RESET"
+  muted "Unofficial install helper (not affiliated with the Pelican project)."
+  muted "You will confirm, then pick express or manual mode. Root is required."
+  muted "Docs: https://pelican.dev/docs/panel/getting-started"
+  echo
 }
 
 banner() {
   # Do not clear screen — keeps scrollback for troubleshooting
-  box_top
-  box_line "  ___      _ _            ___          _ _       _   "
-  box_line " | _ \\___ | (_)__ _ _ _  | _ \\_ _ ___ (_) |_ ___| |_ "
-  box_line " |  _/ _ \\| | / _\` | '_| |  _/ _\` / -_)|  _/ -_)  _|"
-  box_line " |_| \\___/|_|_\\__,_|_|   |_| \\__,_\\___| \\__\\___|\\__|"
-  box_line ""
-  box_line "  Panel & Wings installer  ${DIM}v${SCRIPT_VERSION}${RESET}${BOLD}  ·  ${C_MUTED}unofficial helper${RESET}"
-  box_bottom
+  banner_rule
+  banner_row "  ___      _ _            ___          _ _       _"
+  banner_row " | _ \\___ | (_)__ _ _ _  | _ \\_ _ ___ (_) |_ ___| |_"
+  banner_row " |  _/ _ \\| | / _\` | '_| |  _/ _\` / -_)|  _/ -_)  _|"
+  banner_row " |_| \\___/|_|_\\__,_|_|   |_| \\__,_\\___| \\__\\___|\\__|"
+  banner_row ""
+  banner_row "  Panel & Wings  ·  v${SCRIPT_VERSION}  ·  unofficial helper"
+  banner_rule
   echo
 }
 
@@ -274,17 +315,17 @@ select_php_version() {
       PHP_VERSION="8.5"
     elif apt-cache show "php8.4-fpm" &>/dev/null; then
       PHP_VERSION="8.4"
-      warn "php8.5 not in repos yet; using PHP 8.4 (supported by Pelican)."
+      [[ "${QUIET_INSTALL:-0}" != "1" ]] && warn "php8.5 not in repos yet; using PHP 8.4 (supported by Pelican)."
     elif apt-cache show "php8.3-fpm" &>/dev/null; then
       PHP_VERSION="8.3"
-      warn "Using PHP 8.3 from repositories (Pelican supports 8.2–8.5)."
+      [[ "${QUIET_INSTALL:-0}" != "1" ]] && warn "Using PHP 8.3 from repositories (Pelican supports 8.2–8.5)."
     else
       PHP_VERSION="8.3"
-      warn "Could not probe packages; defaulting to PHP 8.3 — ensure Pelican-supported PHP is installed."
+      [[ "${QUIET_INSTALL:-0}" != "1" ]] && warn "Could not probe packages; defaulting to PHP 8.3 — ensure Pelican-supported PHP is installed."
     fi
   else
     PHP_VERSION="8.3"
-    warn "Non-Debian family: defaulting PHP version label to 8.3 — verify php-fpm package names."
+    [[ "${QUIET_INSTALL:-0}" != "1" ]] && warn "Non-Debian family: defaulting PHP version label to 8.3 — verify php-fpm package names."
   fi
   PHP_PKG_PREFIX="php${PHP_VERSION}"
   SUMMARY[php_version]="$PHP_VERSION"
@@ -295,14 +336,19 @@ ensure_php_repo_debian() {
   if apt-cache show "php8.5-fpm" &>/dev/null; then
     return 0
   fi
-  info "Adding ondrej/php PPA (or sury for Debian) for recent PHP versions…"
-  apt-get update -qq
+  [[ "${QUIET_INSTALL:-0}" != "1" ]] && info "Adding ondrej/php PPA (or sury for Debian) for recent PHP versions…"
+  run_apt_quiet apt-get update -qq
   local spq=()
   [[ "${QUIET_INSTALL:-0}" == "1" ]] && spq=(-qq)
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "${spq[@]}" software-properties-common curl gnupg lsb-release
+  run_apt_quiet apt-get install -y "${spq[@]}" software-properties-common curl gnupg lsb-release
   if [[ "$OS_ID" == "ubuntu" ]]; then
     if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
-      add-apt-repository -y ppa:ondrej/php &>/dev/null
+      echo "---- add-apt-repository ondrej/php ----" >>"$EXPRESS_LOG"
+      add-apt-repository -y ppa:ondrej/php >>"$EXPRESS_LOG" 2>&1 || {
+        error "add-apt-repository failed; tail of $EXPRESS_LOG:"
+        tail -n 40 "$EXPRESS_LOG" >&2
+        exit 1
+      }
     else
       add-apt-repository -y ppa:ondrej/php
     fi
@@ -310,15 +356,15 @@ ensure_php_repo_debian() {
     curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg 2>/dev/null || true
     echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list
   fi
-  apt-get update -qq
+  run_apt_quiet apt-get update -qq
 }
 
 apt_install_panel_deps() {
   ensure_php_repo_debian
-  apt-get update -qq
+  run_apt_quiet apt-get update -qq
   local apt_q=()
   [[ "${QUIET_INSTALL:-0}" == "1" ]] && apt_q=(-qq)
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_q[@]}" \
+  run_apt_quiet apt-get install -y "${apt_q[@]}" \
     "nginx" \
     "mariadb-server" "mariadb-client" \
     "${PHP_PKG_PREFIX}-fpm" "${PHP_PKG_PREFIX}-cli" "${PHP_PKG_PREFIX}-common" \
@@ -326,8 +372,8 @@ apt_install_panel_deps() {
     "${PHP_PKG_PREFIX}-bcmath" "${PHP_PKG_PREFIX}-xml" "${PHP_PKG_PREFIX}-curl" \
     "${PHP_PKG_PREFIX}-zip" "${PHP_PKG_PREFIX}-intl" "${PHP_PKG_PREFIX}-sqlite3" \
     curl tar unzip git ca-certificates
-  systemctl enable --now "${PHP_PKG_PREFIX}-fpm"
-  systemctl restart "${PHP_PKG_PREFIX}-fpm"
+  run_cmd_quiet systemctl enable --now "${PHP_PKG_PREFIX}-fpm"
+  run_cmd_quiet systemctl restart "${PHP_PKG_PREFIX}-fpm"
 }
 
 # ---------------------------------------------------------------------------
@@ -389,7 +435,7 @@ create_database_and_user() {
 wait_for_mysql_user() {
   local db_user="$1" db_pass="$2"
   local tries=0
-  info "Waiting for MySQL to accept TCP logins for ${db_user}@127.0.0.1…"
+  [[ "${QUIET_INSTALL:-0}" != "1" ]] && info "Waiting for MySQL to accept TCP logins for ${db_user}@127.0.0.1…"
   while [[ $tries -lt 45 ]]; do
     if mysql -h 127.0.0.1 -u "$db_user" -p"$db_pass" -e "SELECT 1" &>/dev/null; then
       return 0
@@ -446,7 +492,7 @@ apply_pgsql_to_dotenv() {
 # ---------------------------------------------------------------------------
 install_panel_files() {
   mkdir -p "$PELICAN_ROOT"
-  info "Downloading Pelican Panel release…"
+  [[ "${QUIET_INSTALL:-0}" != "1" ]] && info "Downloading Pelican Panel release…"
   # Never use tar -v: it lists thousands of files and floods the console
   curl -fsSL "$PELICAN_RELEASE_URL" | tar -xz -C "$PELICAN_ROOT" --strip-components=0 2>/dev/null || {
     curl -fsSL "$PELICAN_RELEASE_URL" | tar -xz -C "$PELICAN_ROOT"
@@ -499,7 +545,7 @@ configure_panel_env() {
   fi
 
   wait_for_mysql_user "$db_user" "$db_pass"
-  info "Writing MySQL settings to .env (skipping interactive p:environment:database)…"
+  [[ "${QUIET_INSTALL:-0}" != "1" ]] && info "Writing MySQL settings to .env (skipping interactive p:environment:database)…"
   apply_mysql_to_dotenv "$db_name" "$db_user" "$db_pass"
   if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
     php artisan config:clear --no-interaction -q 2>/dev/null || php artisan config:clear --no-interaction
@@ -676,8 +722,8 @@ NGX
   fi
 
   ln -sf "$conf" /etc/nginx/sites-enabled/pelican.conf
-  nginx -t
-  systemctl reload nginx
+  run_cmd_quiet nginx -t
+  run_cmd_quiet systemctl reload nginx
 }
 
 # ---------------------------------------------------------------------------
@@ -685,11 +731,15 @@ NGX
 # ---------------------------------------------------------------------------
 install_docker() {
   if command -v docker &>/dev/null; then
-    info "Docker already installed."
-    systemctl enable --now docker 2>/dev/null || true
+    [[ "${QUIET_INSTALL:-0}" != "1" ]] && info "Docker already installed."
+    if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+      systemctl enable --now docker >>"$EXPRESS_LOG" 2>&1 || true
+    else
+      systemctl enable --now docker 2>/dev/null || true
+    fi
     return 0
   fi
-  info "Installing Docker CE (get.docker.com)…"
+  [[ "${QUIET_INSTALL:-0}" != "1" ]] && info "Installing Docker CE (get.docker.com)…"
   if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
     local dlog="/tmp/pelican-docker-install.log"
     if ! curl -fsSL https://get.docker.com/ | CHANNEL=stable sh >"$dlog" 2>&1; then
@@ -697,10 +747,11 @@ install_docker() {
       tail -n 50 "$dlog" >&2
       exit 1
     fi
+    run_cmd_quiet systemctl enable --now docker
   else
     curl -fsSL https://get.docker.com/ | CHANNEL=stable sh
+    systemctl enable --now docker
   fi
-  systemctl enable --now docker
 }
 
 install_wings_binary() {
@@ -708,7 +759,7 @@ install_wings_binary() {
   arch=$(uname -m)
   [[ "$arch" == "x86_64" ]] && arch="amd64" || arch="arm64"
   mkdir -p /etc/pelican /var/run/wings /var/lib/pelican/volumes
-  info "Downloading Wings (${arch})…"
+  [[ "${QUIET_INSTALL:-0}" != "1" ]] && info "Downloading Wings (${arch})…"
   curl -fsSL -o /usr/local/bin/wings "https://github.com/pelican-dev/wings/releases/latest/download/wings_linux_${arch}"
   chmod u+x /usr/local/bin/wings
 }
@@ -737,8 +788,8 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable wings
+  run_cmd_quiet systemctl daemon-reload
+  run_cmd_quiet systemctl enable wings
 }
 
 # ---------------------------------------------------------------------------
@@ -895,18 +946,49 @@ set_summary_db_web_installer_info() {
   esac
 }
 
-# Shown as soon as the Panel responds; lets the user log in before Docker/Wings.
+# Shown as soon as the Panel responds. Uses SUMMARY (filled before call): URLs, DB, admin, APP_KEY.
 print_panel_login_banner() {
-  local panel_url="$1" email="$2" user="$3" pass="$4"
-  section "Panel is ready — log in here first"
+  local panel_url="${SUMMARY[panel_url]:-}"
+  section "Panel is ready — log in & web installer values"
   echo
-  printf '  %s%-20s%s %s\n' "$BOLD" "Panel URL" "$RESET" "$panel_url"
-  printf '  %s%-20s%s %s\n' "$BOLD" "Web installer" "$RESET" "${panel_url}/installer"
-  printf '     %s%s%s\n' "$C_MUTED" "(Database was configured by this script; you can skip the DB step or match values below.)" "$RESET"
+  printf '  %s%-22s%s %s\n' "$BOLD" "Panel URL" "$RESET" "$panel_url"
+  if [[ "$panel_url" == http://* || "$panel_url" == https://* ]]; then
+    printf '  %s%-22s%s %s\n' "$BOLD" "Web installer URL" "$RESET" "${panel_url}/installer"
+  else
+    printf '  %s%-22s%s %s\n' "$BOLD" "Web installer URL" "$RESET" "(open Panel URL above, path /installer)"
+  fi
   echo
-  printf '  %s%-20s%s %s\n' "$BOLD" "Admin email" "$RESET" "$email"
-  printf '  %s%-20s%s %s\n' "$BOLD" "Admin username" "$RESET" "$user"
-  printf '  %s%-20s%s %s\n' "$BOLD" "Admin password" "$RESET" "$pass"
+
+  if [[ -n "${SUMMARY[db_name]:-}" ]]; then
+    printf '  %s%s%s\n' "$C_HEAD" "  Web installer — Database (same fields as the browser form)" "$RESET"
+    if [[ -n "${SUMMARY[db_ui_driver]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Driver (dropdown)" "$RESET" "${SUMMARY[db_ui_driver]}"
+    fi
+    if [[ -n "${SUMMARY[db_engine]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Engine / .env" "$RESET" "${SUMMARY[db_engine]}"
+    fi
+    if [[ -n "${SUMMARY[db_host]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Host" "$RESET" "${SUMMARY[db_host]}"
+    fi
+    if [[ -n "${SUMMARY[db_port]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Port" "$RESET" "${SUMMARY[db_port]}"
+    fi
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Database name" "$RESET" "${SUMMARY[db_name]}"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Username" "$RESET" "${SUMMARY[db_user]}"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Password" "$RESET" "${SUMMARY[db_password]}"
+    echo
+  fi
+
+  printf '  %s%s%s\n' "$C_HEAD" "  Admin account (first login)" "$RESET"
+  printf '  %s%-22s%s %s\n' "$BOLD" "  Email" "$RESET" "${SUMMARY[admin_email]:-}"
+  printf '  %s%-22s%s %s\n' "$BOLD" "  Username" "$RESET" "${SUMMARY[admin_username]:-}"
+  printf '  %s%-22s%s %s\n' "$BOLD" "  Password" "$RESET" "${SUMMARY[admin_password]:-}"
+  if [[ -n "${SUMMARY[app_key]:-}" ]]; then
+    echo
+    printf '  %s%-22s%s %s\n' "$BOLD" "APP_KEY (backup)" "$RESET" "${SUMMARY[app_key]}"
+  fi
+  echo
+  muted "The database and admin user are already created; use the values above if the web installer asks for them."
   echo
 }
 
@@ -1009,8 +1091,12 @@ run_express() {
     set_summary_db_web_installer_info "mysql"
   fi
 
+  if [[ "$INSTALL_COMPONENTS" == "panel" ]]; then
+    print_panel_login_banner
+  fi
+
   if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
-    print_panel_login_banner "http://${fqdn}" "$admin_email" "$admin_user" "$admin_pass"
+    print_panel_login_banner
     wings_setup_guidance "http://${fqdn}"
     pause_before_wings_install
     section "Step 2 — Docker + Wings"
@@ -1184,7 +1270,7 @@ run_manual() {
       if [[ ! "$gurl" == http://* && ! "$gurl" == https://* ]]; then
         gurl="http://${fqdn}"
       fi
-      print_panel_login_banner "$gurl" "$admin_email" "$admin_user" "$admin_pass"
+      print_panel_login_banner
       wings_setup_guidance "$gurl"
       pause_before_wings_install
     }
@@ -1212,6 +1298,7 @@ run_manual() {
 main() {
   require_root
   detect_environment
+  intro_before_ui
   banner
   os_warning_block
 

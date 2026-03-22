@@ -141,57 +141,100 @@ banner() {
   echo
 }
 
-# Express: step line with ASCII progress bar (only called from run_express).
+# Express: announce step (live bar runs during express_run on stderr).
 express_step() {
   local cur="${1:-1}" total="${2:-1}" msg="${3:-}"
-  local bar_w=20
   [[ "$total" =~ ^[0-9]+$ ]] || total=1
   [[ "$cur" =~ ^[0-9]+$ ]] || cur=1
   [[ "$total" -lt 1 ]] && total=1
   [[ "$cur" -lt 1 ]] && cur=1
   [[ "$cur" -gt "$total" ]] && cur="$total"
-  local filled=$(( cur * bar_w / total ))
-  [[ "$cur" -ge 1 && "$filled" -lt 1 ]] && filled=1
-  [[ "$cur" -eq "$total" ]] && filled=$bar_w
-  local empty=$(( bar_w - filled ))
-  local bar="" i
-  for ((i = 0; i < filled; i++)); do bar+="#"; done
-  for ((i = 0; i < empty; i++)); do bar+="."; done
-  local pct=$(( cur * 100 / total ))
-  printf '%s[%sexpress%s]%s %s/%s [%s] %3d%%  %s%s\n' \
-    "$C_STEP" "$BOLD" "$RESET" "$RESET" "$cur" "$total" "$bar" "$pct" "$msg" "$RESET"
+  export EXPRESS_STEP_NUM="$cur"
+  export EXPRESS_STEP_TOTAL="$total"
+  printf '%s[%sexpress%s]%s %s/%s — %s%s\n' \
+    "$C_STEP" "$BOLD" "$RESET" "$RESET" "$cur" "$total" "$msg" "$RESET"
 }
 
-# Express only: background spinner on stderr while a slow command runs (apt, composer, …).
-EXPRESS_SPIN_PID=""
+# Express only: animated overall % + bar on stderr while a slow command runs (updates ~10×/s).
+EXPRESS_PROGRESS_PID=""
 
-express_spin_start() {
+_express_progress_pct_bounds() {
+  local cur="${1:-1}" total="${2:-1}"
+  [[ "$total" -lt 1 ]] && total=1
+  EXPRESS_PCT_LO=$(( (cur - 1) * 100 / total ))
+  EXPRESS_PCT_HI=$(( cur * 100 / total ))
+  [[ "$cur" -eq "$total" ]] && EXPRESS_PCT_HI=100
+  [[ "$EXPRESS_PCT_HI" -le "$EXPRESS_PCT_LO" ]] && EXPRESS_PCT_HI=$(( EXPRESS_PCT_LO + 1 ))
+}
+
+express_progress_start() {
   local label="${1:-Working}"
   [[ "${QUIET_INSTALL:-0}" != "1" ]] && return 0
+  local cur="${EXPRESS_STEP_NUM:-1}" total="${EXPRESS_STEP_TOTAL:-1}"
   printf '\n' >&2
   (
-    local spin='|/-+' # 4 ASCII chars (avoid \ in quotes)
-    local i=0
+    local pct_lo pct_hi pct tick inner span start_sec bar_w=22 filled i b pos
+    pct_lo=$(( (cur - 1) * 100 / total ))
+    pct_hi=$(( cur * 100 / total ))
+    [[ "$cur" -eq "$total" ]] && pct_hi=100
+    [[ "$pct_hi" -le "$pct_lo" ]] && pct_hi=$(( pct_lo + 1 ))
+    span=$(( pct_hi - pct_lo ))
+    [[ "$span" -lt 1 ]] && span=1
+    start_sec=$(date +%s)
+    pct=$pct_lo
     while true; do
-      printf '\r  %s%s %s%s…%s' "$C_STEP" "${spin:$i:1}" "$BOLD" "$label" "$RESET" >&2
-      i=$(((i + 1) % 4))
-      sleep 0.12
+      tick=$(($(date +%s) - start_sec))
+      # Crawl from pct_lo toward pct_hi-1 over ~35s in this step (keeps moving on long apt/docker runs).
+      inner=$(( tick * span / 35 ))
+      pct=$(( pct_lo + inner ))
+      [[ "$pct" -ge "$pct_hi" ]] && pct=$(( pct_hi - 1 ))
+      [[ "$cur" -eq "$total" ]] && [[ "$pct" -ge 99 ]] && pct=99
+      filled=$(( pct * bar_w / 100 ))
+      [[ "$filled" -gt "$bar_w" ]] && filled=$bar_w
+      [[ "$filled" -lt 1 ]] && filled=1
+      pos=0
+      [[ "$filled" -gt 1 ]] && pos=$(( (tick / 2) % filled ))
+      b=""
+      for ((i = 0; i < bar_w; i++)); do
+        if [[ "$i" -lt "$filled" ]]; then
+          if [[ "$filled" -gt 1 && "$i" -eq "$pos" ]]; then
+            b+="${BOLD}#${RESET}"
+          else
+            b+='='
+          fi
+        else
+          b+='·'
+        fi
+      done
+      printf '\r  %s[express %s/%s]%s [%b] %3d%%  %s%s%s…%s' \
+        "$C_STEP" "$cur" "$total" "$RESET" "$b" "$pct" "$BOLD" "$label" "$RESET" "$C_STEP" "$RESET" >&2
+      sleep 0.1
     done
   ) &
-  EXPRESS_SPIN_PID=$!
+  EXPRESS_PROGRESS_PID=$!
 }
 
-express_spin_stop() {
+express_progress_stop() {
   [[ "${QUIET_INSTALL:-0}" != "1" ]] && return 0
-  if [[ -n "${EXPRESS_SPIN_PID:-}" ]] && kill -0 "$EXPRESS_SPIN_PID" 2>/dev/null; then
-    kill "$EXPRESS_SPIN_PID" 2>/dev/null || true
-    wait "$EXPRESS_SPIN_PID" 2>/dev/null || true
+  if [[ -n "${EXPRESS_PROGRESS_PID:-}" ]] && kill -0 "$EXPRESS_PROGRESS_PID" 2>/dev/null; then
+    kill "$EXPRESS_PROGRESS_PID" 2>/dev/null || true
+    wait "$EXPRESS_PROGRESS_PID" 2>/dev/null || true
   fi
-  EXPRESS_SPIN_PID=""
-  printf '\r\033[K' >&2
+  EXPRESS_PROGRESS_PID=""
+  local cur="${EXPRESS_STEP_NUM:-1}" total="${EXPRESS_STEP_TOTAL:-1}" pct_hi bar_w=22 filled empty i b
+  _express_progress_pct_bounds "$cur" "$total"
+  pct_hi=$EXPRESS_PCT_HI
+  filled=$(( pct_hi * bar_w / 100 ))
+  [[ "$filled" -gt "$bar_w" ]] && filled=$bar_w
+  empty=$(( bar_w - filled ))
+  b=""
+  for ((i = 0; i < filled; i++)); do b+='='; done
+  for ((i = 0; i < empty; i++)); do b+='·'; done
+  printf '\r  %s[express %s/%s]%s [%s] %3d%%  %s%s%s\n' \
+    "$C_STEP" "$cur" "$total" "$RESET" "$b" "$pct_hi" "$C_OK" "✓" "$RESET" >&2
 }
 
-# Express: run a command/function with spinner (stderr only; does not affect stdout captures).
+# Express: run a command/function with live progress on stderr (stdout unchanged for captures).
 express_run() {
   local label="$1"
   shift
@@ -199,12 +242,12 @@ express_run() {
     "$@"
     return $?
   fi
-  express_spin_start "$label"
+  express_progress_start "$label"
   set +e
   "$@"
   local ec=$?
   set -e
-  express_spin_stop
+  express_progress_stop
   return "$ec"
 }
 
@@ -522,24 +565,29 @@ panel_finalize_cli() {
 }
 
 # Panel + Wings on same host: p:node:make + p:node:configuration → /etc/pelican/config.yml, then start wings.
-# $1 = panel base URL (APP_URL), $2 = Nginx server_name / primary host (for wings subdomain when HTTPS + domain).
+# $1 = panel base URL (APP_URL), $2 = Nginx server_name (must be a host your *browser* resolves to this server).
 pelican_autoconfigure_wings_local() {
   local panel_base="$1" server_name="$2"
   local wings_host scheme="http"
 
-  if [[ "$panel_base" == https://* ]] && ! [[ "$server_name" =~ ^[0-9.]+$ ]]; then
-    wings_host="wings.${server_name}"
-  else
+  # "Reachable" in the Panel UI checks from *your browser*: FQDN must resolve to this machine on the
+  # client PC. Names like wings.localhost only resolve to 127.0.0.1 on each computer — so the browser
+  # talks to itself, not the server. Prefer the same host you use in the address bar (LAN IP or DNS).
+  if [[ "$server_name" == "127.0.0.1" || "${server_name,,}" == "localhost" ]]; then
     wings_host="wings.localhost"
+    warn "server_name is ${server_name}: using ${wings_host}. From another PC the node will show not \"Reachable\" unless you add on *that* PC: <server-ip> wings.localhost — or edit the node FQDN in the Panel to your server's LAN IP/hostname and re-export YAML."
+  else
+    wings_host="$server_name"
+    if [[ "$panel_base" == https://* ]] && ! [[ "$server_name" =~ ^[0-9.]+$ ]]; then
+      scheme="https"
+    else
+      scheme="http"
+    fi
   fi
 
-  if [[ "$panel_base" == https://* && "$wings_host" != "wings.localhost" ]]; then
-    scheme="https"
-  fi
-
-  if ! grep -qE "[[:space:]]${wings_host}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
-    echo "127.0.0.1   ${wings_host}" >> /etc/hosts
-    info "Added ${wings_host} to /etc/hosts (Pelican rejects 127.0.0.1/localhost as node FQDN)."
+  if [[ "$wings_host" == "wings.localhost" ]] && ! grep -qE "[[:space:]]wings\.localhost([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+    echo "127.0.0.1   wings.localhost" >> /etc/hosts
+    info "Added wings.localhost to this server's /etc/hosts (Panel→Wings on loopback). Other PCs still need the same name in *their* hosts file or a different node FQDN."
   fi
 
   pushd "$PELICAN_ROOT" >/dev/null

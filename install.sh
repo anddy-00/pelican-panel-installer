@@ -323,6 +323,33 @@ mysql_exec() {
   fi
 }
 
+# DB password for express: mixes admin password + epoch + subsecond + urandom (not only pure openssl rand).
+generate_db_password_from_seed() {
+  local seed="$1"
+  local s ns r out
+  s=$(date +%s)
+  ns=$(date +%N 2>/dev/null || echo "${RANDOM}${RANDOM}")
+  r=$(head -c 64 /dev/urandom 2>/dev/null | base64 | tr -d '\n')
+  out=""
+  if command -v openssl &>/dev/null; then
+    out=$(printf '%s|%s|%s|%s' "$seed" "$s" "$ns" "$r" | openssl dgst -sha256 -binary 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | head -c 28)
+  fi
+  [[ -n "$out" ]] || out=$(printf '%s|%s|%s|%s' "$seed" "$s" "$ns" "$r" | sha256sum | awk '{print $1}' | head -c 28)
+  [[ -n "$out" ]] || out=$(openssl rand -hex 16 2>/dev/null)
+  printf '%s' "$out"
+}
+
+apply_app_url_to_dotenv() {
+  local url="$1"
+  local env_file="$PELICAN_ROOT/.env"
+  [[ -f "$env_file" ]] || return 0
+  if grep -q '^APP_URL=' "$env_file"; then
+    sed -i.bak "s#^APP_URL=.*#APP_URL=${url}#" "$env_file" 2>/dev/null || true
+  else
+    echo "APP_URL=${url}" >> "$env_file"
+  fi
+}
+
 create_database_and_user() {
   local db_name="$1" db_user="$2" db_pass="$3"
   local ep eu
@@ -613,13 +640,14 @@ install_wings_binary() {
   local arch
   arch=$(uname -m)
   [[ "$arch" == "x86_64" ]] && arch="amd64" || arch="arm64"
-  mkdir -p /etc/pelican /var/run/wings
+  mkdir -p /etc/pelican /var/run/wings /var/lib/pelican/volumes
   info "Downloading Wings (${arch})…"
   curl -fsSL -o /usr/local/bin/wings "https://github.com/pelican-dev/wings/releases/latest/download/wings_linux_${arch}"
   chmod u+x /usr/local/bin/wings
 }
 
 wings_systemd() {
+  # RuntimeDirectory creates /run/wings before start (fixes systemd PIDFile warnings).
   cat > /etc/systemd/system/wings.service <<'UNIT'
 [Unit]
 Description=Wings Daemon
@@ -630,8 +658,9 @@ PartOf=docker.service
 [Service]
 User=root
 WorkingDirectory=/etc/pelican
+RuntimeDirectory=wings
 LimitNOFILE=4096
-PIDFile=/var/run/wings/daemon.pid
+PIDFile=/run/wings/daemon.pid
 ExecStart=/usr/local/bin/wings
 Restart=on-failure
 StartLimitInterval=180
@@ -734,9 +763,19 @@ print_summary() {
     printf '  %s%-22s%s %s\n' "$BOLD" "APP_KEY (backup!)" "$RESET" "${SUMMARY[app_key]}"
   fi
   if [[ "${SUMMARY[wings_installed]:-}" == "yes" ]]; then
-    printf '  %s%-22s%s %s\n' "$BOLD" "Wings binary" "$RESET" "/usr/local/bin/wings"
-    printf '  %s%-22s%s %s\n' "$BOLD" "Wings config" "$RESET" "/etc/pelican/config.yml (from Panel → Nodes → Configuration)"
-    printf '  %s%-22s%s %s\n' "$BOLD" "Wings service" "$RESET" "systemctl start wings (after valid config)"
+    echo
+    printf '  %s%s%s\n' "$C_HEAD" "  Wings — this is normal: no node appears until you create it in the Panel" "$RESET"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Installed on disk" "$RESET" "Docker, /usr/local/bin/wings, systemd unit wings.service (enabled)"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Not installed by script" "$RESET" "A Panel node (metadata + token + config YAML) — Pelican requires that from the UI"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Config file" "$RESET" "/etc/pelican/config.yml (empty until you paste YAML from the Panel)"
+    echo
+    printf '  %s  Next steps:%s\n' "$BOLD" "$RESET"
+    printf '    %s1.%s In the Panel go to %sAdmin -> Nodes -> Create New%s, fill FQDN/port, save.\n' "$DIM" "$RESET" "$BOLD" "$RESET"
+    printf '    %s2.%s Open the node -> %sConfiguration%s tab -> copy the YAML (or use Auto Deploy).\n' "$DIM" "$RESET" "$BOLD" "$RESET"
+    printf '    %s3.%s Put it in %s/etc/pelican/config.yml%s then: %ssudo systemctl start wings%s\n' "$DIM" "$RESET" "$BOLD" "$RESET" "$BOLD" "$RESET"
+    printf '    %s4.%s If the Panel uses HTTPS, Wings must use TLS too (see Pelican SSL docs).\n' "$DIM" "$RESET"
+    echo
+    muted "  Docs: https://pelican.dev/docs/wings/install"
   fi
   echo
   muted "Official docs: https://pelican.dev/docs/panel/getting-started · https://pelican.dev/docs/wings/install"
@@ -780,6 +819,25 @@ set_summary_db_web_installer_info() {
   esac
 }
 
+# Shown when installing Panel + Wings: Panel must be ready first; explains remote / APP_URL.
+wings_setup_guidance() {
+  local panel_base="$1"
+  section "Step 2 — Wings (after the Panel is installed)"
+  info "The Wings config field \"remote\" must match how the Panel is reached (same as APP_URL in .env)."
+  printf '  %s%-20s%s %s\n' "$BOLD" "Set APP_URL to" "$RESET" "${panel_base}"
+  muted "If you open the Panel in the browser as http://192.168.x.x, that exact base URL must be APP_URL and Wings \"remote\"."
+  echo
+  info "1) Log into the Panel → Admin → Nodes → Create New."
+  info "2) Domain: e.g. wings.localhost — on this server add to /etc/hosts:"
+  printf '     %s%s%s\n' "$BOLD" "127.0.0.1   wings.localhost" "$RESET"
+  info "3) Port 8080, SSL: HTTP (unless you use HTTPS everywhere)."
+  info "4) Save the node → Configuration → copy YAML to /etc/pelican/config.yml (or Auto Deploy)."
+  info "5) Check \"remote:\" in that YAML equals: ${panel_base}"
+  info "6) Then: sudo systemctl start wings"
+  muted "If YAML lists ssl.cert paths but api.ssl.enabled is false, Wings ignores those paths until you enable HTTPS."
+  echo
+}
+
 # ---------------------------------------------------------------------------
 # Express flow
 # ---------------------------------------------------------------------------
@@ -791,11 +849,14 @@ run_express() {
 
   db_name="pelican"
   db_user="pelican"
-  db_pass=$(openssl rand -base64 32 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 24)
-  [[ -n "$db_pass" ]] || db_pass=$(head -c 32 /dev/urandom 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
   admin_email=$(prompt "Admin email (first user)" "admin@localhost")
   admin_user=$(prompt "Admin username" "admin")
   admin_pass=$(prompt_secret "Admin password (hidden)")
+  if [[ "$INSTALL_COMPONENTS" == "panel" || "$INSTALL_COMPONENTS" == "both" ]]; then
+    db_pass=$(generate_db_password_from_seed "$admin_pass")
+  else
+    db_pass=""
+  fi
 
   if [[ "$INSTALL_COMPONENTS" != "wings" ]]; then
     local auto_ip
@@ -811,6 +872,7 @@ run_express() {
   SUMMARY[admin_password]="$admin_pass"
 
   if [[ "$INSTALL_COMPONENTS" == "panel" || "$INSTALL_COMPONENTS" == "both" ]]; then
+    section "Step 1 — Pelican Panel"
     select_php_version
     info "Installing packages (nginx, MariaDB, PHP ${PHP_VERSION})…"
     apt_install_panel_deps
@@ -825,6 +887,8 @@ run_express() {
     panel_permissions
     setup_cron
     nginx_write_site "$fqdn" 0
+    apply_app_url_to_dotenv "http://${fqdn}"
+    ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
     SUMMARY[panel_path]="$PELICAN_ROOT"
     SUMMARY[app_key]="$(extract_app_key)"
     SUMMARY[db_name]="$db_name"
@@ -833,11 +897,21 @@ run_express() {
     set_summary_db_web_installer_info "mysql"
   fi
 
+  if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
+    wings_setup_guidance "http://${fqdn}"
+  fi
+
   if [[ "$INSTALL_COMPONENTS" == "wings" || "$INSTALL_COMPONENTS" == "both" ]]; then
+    if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
+      section "Step 2 — Docker + Wings (binaries and systemd)"
+    else
+      section "Wings — Docker + Wings (binaries and systemd)"
+    fi
     install_docker
     install_wings_binary
     wings_systemd
     SUMMARY[wings_installed]="yes"
+    info "Wings: create the node in the Panel, ensure config.yml \"remote\" matches APP_URL, then: sudo systemctl start wings"
   fi
 
   print_summary
@@ -863,17 +937,25 @@ run_manual() {
   SUMMARY[panel_path]="$PELICAN_ROOT"
 
   echo
-  printf '%sDatabase%s\n' "$BOLD" "$RESET"
-  db_driver=$(prompt "DB driver (mysql, sqlite, pgsql)" "mysql")
-  db_name=$(prompt "Database name" "pelican")
-  db_user=$(prompt "Database user" "pelican")
-  db_pass=$(prompt_secret "Database password")
-
-  echo
   printf '%sAdmin account (panel)%s\n' "$BOLD" "$RESET"
   admin_email=$(prompt "Admin email" "admin@localhost")
   admin_user=$(prompt "Admin username" "admin")
   admin_pass=$(prompt_secret "Admin password")
+
+  echo
+  printf '%sDatabase%s\n' "$BOLD" "$RESET"
+  db_driver=$(prompt "DB driver (mysql, sqlite, pgsql)" "mysql")
+  db_name=$(prompt "Database name" "pelican")
+  db_user=$(prompt "Database user" "pelican")
+  if [[ "$db_driver" == "mysql" ]]; then
+    if confirm "Generate database password from admin password + time + entropy (recommended)?" "y"; then
+      db_pass=$(generate_db_password_from_seed "$admin_pass")
+    else
+      db_pass=$(prompt_secret "Database password")
+    fi
+  else
+    db_pass=$(prompt_secret "Database password")
+  fi
 
   if [[ "$INSTALL_COMPONENTS" != "wings" ]]; then
     local auto_ip
@@ -902,6 +984,7 @@ run_manual() {
   set_summary_db_web_installer_info "$db_driver"
 
   if [[ "$INSTALL_COMPONENTS" == "panel" || "$INSTALL_COMPONENTS" == "both" ]]; then
+    section "Step 1 — Pelican Panel"
     if [[ "$webserver" != "nginx" ]]; then
       warn "Apache/Caddy vhost generation is not fully automated in this script."
       warn "Install deps, then copy examples from: https://pelican.dev/docs/panel/webserver-config"
@@ -962,14 +1045,40 @@ run_manual() {
       SUMMARY[panel_url]="(configure ${webserver} manually)"
     fi
 
+    {
+      local pub="${SUMMARY[panel_url]}"
+      if [[ "$pub" == http://* || "$pub" == https://* ]]; then
+        apply_app_url_to_dotenv "$pub"
+      else
+        apply_app_url_to_dotenv "http://${fqdn}"
+      fi
+    }
+    ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
+
     SUMMARY[app_key]="$(extract_app_key)"
   fi
 
+  if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
+    {
+      local gurl="${SUMMARY[panel_url]}"
+      if [[ ! "$gurl" == http://* && ! "$gurl" == https://* ]]; then
+        gurl="http://${fqdn}"
+      fi
+      wings_setup_guidance "$gurl"
+    }
+  fi
+
   if [[ "$INSTALL_COMPONENTS" == "wings" || "$INSTALL_COMPONENTS" == "both" ]]; then
+    if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
+      section "Step 2 — Docker + Wings (binaries and systemd)"
+    else
+      section "Wings — Docker + Wings (binaries and systemd)"
+    fi
     install_docker
     install_wings_binary
     wings_systemd
     SUMMARY[wings_installed]="yes"
+    info "Wings: create the node in the Panel, ensure config.yml \"remote\" matches APP_URL, then: sudo systemctl start wings"
   fi
 
   print_summary

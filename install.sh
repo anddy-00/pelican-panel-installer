@@ -46,60 +46,73 @@ if [[ -t 1 ]]; then
   C_WARN=$'\033[38;5;214m'
   C_ERR=$'\033[38;5;196m'
   C_MUTED=$'\033[38;5;245m'
+  C_STEP=$'\033[38;5;141m'
 else
   BOLD=''; DIM=''; RESET=''
-  C_HEAD=''; C_ACCENT=''; C_OK=''; C_WARN=''; C_ERR=''; C_MUTED=''
+  C_HEAD=''; C_ACCENT=''; C_OK=''; C_WARN=''; C_ERR=''; C_MUTED=''; C_STEP=''
 fi
+
+# 1 = fewer logs (express); composer/tar/apt/docker redirect or -q
+QUIET_INSTALL="${QUIET_INSTALL:-0}"
+EXPRESS_LOG="${EXPRESS_LOG:-/tmp/pelican-install.log}"
 
 ui_width() { echo "${COLUMNS:-80}"; }
 
 hr() {
   local w; w=$(ui_width)
-  printf '%*s\n' "$w" '' | tr ' ' '─'
+  printf '%*s\n' "$w" '' | tr ' ' '-'
 }
 
+# ASCII-only frame (UTF-8 box chars break on some SSH/console fonts)
 box_top() {
-  printf '%s╔' "$C_ACCENT"
   local w=$(( $(ui_width) - 2 ))
-  printf '%*s' "$w" '' | tr ' ' '═'
-  printf '╗%s\n' "$RESET"
+  printf '%s+' "$C_ACCENT"
+  printf '%*s' "$w" '' | tr ' ' '='
+  printf '+%s\n' "$RESET"
 }
 
 box_bottom() {
-  printf '%s╚' "$C_ACCENT"
   local w=$(( $(ui_width) - 2 ))
-  printf '%*s' "$w" '' | tr ' ' '═'
-  printf '╝%s\n' "$RESET"
+  printf '%s+' "$C_ACCENT"
+  printf '%*s' "$w" '' | tr ' ' '='
+  printf '+%s\n' "$RESET"
 }
 
 box_line() {
   local text="$1"
   local pad=$(( $(ui_width) - 4 - ${#text} ))
-  printf '%s║ %s%*s%s ║%s\n' "$C_ACCENT" "$BOLD$text$RESET" "$pad" '' '' "$RESET"
+  [[ $pad -lt 0 ]] && pad=0
+  printf '%s| %s%*s%s |%s\n' "$C_ACCENT" "$BOLD$text$RESET" "$pad" '' '' "$RESET"
 }
 
 banner() {
-  clear 2>/dev/null || true
+  # Do not clear screen — keeps scrollback for troubleshooting
   box_top
   box_line "  ___      _ _            ___          _ _       _   "
-  box_line " | _ \___ | (_)__ _ _ _  | _ \_ _ ___ (_) |_ ___| |_ "
-  box_line " |  _/ _ \| | / _\` | '_| |  _/ _\` / -_)|  _/ -_)  _|"
-  box_line " |_| \___/|_|_\__,_|_|   |_| \__,_\___| \__\___|\__|"
+  box_line " | _ \\___ | (_)__ _ _ _  | _ \\_ _ ___ (_) |_ ___| |_ "
+  box_line " |  _/ _ \\| | / _\` | '_| |  _/ _\` / -_)|  _/ -_)  _|"
+  box_line " |_| \\___/|_|_\\__,_|_|   |_| \\__,_\\___| \\__\\___|\\__|"
   box_line ""
   box_line "  Panel & Wings installer  ${DIM}v${SCRIPT_VERSION}${RESET}${BOLD}  ·  ${C_MUTED}unofficial helper${RESET}"
   box_bottom
   echo
 }
 
+# Express: one status line per phase (no wall of tar/composer output)
+express_step() {
+  local cur="$1" total="$2" msg="$3"
+  printf '%s[%sexpress%s]%s (%s/%s) %s%s\n' "$C_STEP" "$BOLD" "$RESET" "$RESET" "$cur" "$total" "$msg" "$RESET"
+}
+
 section() {
   echo
-  printf '%s━━ %s%s%s\n' "$C_HEAD" "$BOLD" "$1" "$RESET"
+  printf '%s-- %s%s%s\n' "$C_HEAD" "$BOLD" "$1" "$RESET"
   hr
 }
 
-info()    { printf '%s▸%s %s\n' "$C_OK" "$RESET" "$*"; }
+info()    { printf '%s>%s %s\n' "$C_OK" "$RESET" "$*"; }
 warn()    { printf '%s!%s %s\n' "$C_WARN" "$RESET" "$*" >&2; }
-error()   { printf '%s✖%s %s\n' "$C_ERR" "$RESET" "$*" >&2; }
+error()   { printf '%sX%s %s\n' "$C_ERR" "$RESET" "$*" >&2; }
 muted()   { printf '%s%s%s\n' "$C_MUTED" "$*" "$RESET"; }
 
 read_tty() {
@@ -284,9 +297,15 @@ ensure_php_repo_debian() {
   fi
   info "Adding ondrej/php PPA (or sury for Debian) for recent PHP versions…"
   apt-get update -qq
-  apt-get install -y software-properties-common curl gnupg lsb-release
+  local spq=()
+  [[ "${QUIET_INSTALL:-0}" == "1" ]] && spq=(-qq)
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${spq[@]}" software-properties-common curl gnupg lsb-release
   if [[ "$OS_ID" == "ubuntu" ]]; then
-    add-apt-repository -y ppa:ondrej/php
+    if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+      add-apt-repository -y ppa:ondrej/php &>/dev/null
+    else
+      add-apt-repository -y ppa:ondrej/php
+    fi
   else
     curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg 2>/dev/null || true
     echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list
@@ -297,7 +316,9 @@ ensure_php_repo_debian() {
 apt_install_panel_deps() {
   ensure_php_repo_debian
   apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  local apt_q=()
+  [[ "${QUIET_INSTALL:-0}" == "1" ]] && apt_q=(-qq)
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_q[@]}" \
     "nginx" \
     "mariadb-server" "mariadb-client" \
     "${PHP_PKG_PREFIX}-fpm" "${PHP_PKG_PREFIX}-cli" "${PHP_PKG_PREFIX}-common" \
@@ -426,7 +447,8 @@ apply_pgsql_to_dotenv() {
 install_panel_files() {
   mkdir -p "$PELICAN_ROOT"
   info "Downloading Pelican Panel release…"
-  curl -fsSL "$PELICAN_RELEASE_URL" | tar -xzv -C "$PELICAN_ROOT" --strip-components=0 2>/dev/null || {
+  # Never use tar -v: it lists thousands of files and floods the console
+  curl -fsSL "$PELICAN_RELEASE_URL" | tar -xz -C "$PELICAN_ROOT" --strip-components=0 2>/dev/null || {
     curl -fsSL "$PELICAN_RELEASE_URL" | tar -xz -C "$PELICAN_ROOT"
   }
 
@@ -448,24 +470,52 @@ install_panel_files() {
   fi
 
   if ! command -v composer &>/dev/null; then
-    curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+      curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer &>/dev/null
+    else
+      curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    fi
   fi
   pushd "$PELICAN_ROOT" >/dev/null
-  COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction --quiet >>"$EXPRESS_LOG" 2>&1 || {
+      error "composer install failed; tail of $EXPRESS_LOG:"
+      tail -n 40 "$EXPRESS_LOG" >&2
+      exit 1
+    }
+  else
+    COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --optimize-autoloader --no-interaction
+  fi
   popd >/dev/null
 }
 
 configure_panel_env() {
   local db_name="$1" db_user="$2" db_pass="$3"
   pushd "$PELICAN_ROOT" >/dev/null
-  php artisan p:environment:setup --no-interaction
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    php artisan p:environment:setup --no-interaction >>"$EXPRESS_LOG" 2>&1
+  else
+    php artisan p:environment:setup --no-interaction
+  fi
 
   wait_for_mysql_user "$db_user" "$db_pass"
   info "Writing MySQL settings to .env (skipping interactive p:environment:database)…"
   apply_mysql_to_dotenv "$db_name" "$db_user" "$db_pass"
-  php artisan config:clear --no-interaction
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    php artisan config:clear --no-interaction -q 2>/dev/null || php artisan config:clear --no-interaction
+  else
+    php artisan config:clear --no-interaction
+  fi
 
-  php artisan migrate --force --no-interaction
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    if ! php artisan migrate --force --no-interaction >>"$EXPRESS_LOG" 2>&1; then
+      error "migrate failed; last lines of $EXPRESS_LOG:"
+      tail -n 30 "$EXPRESS_LOG" >&2
+      exit 1
+    fi
+  else
+    php artisan migrate --force --no-interaction
+  fi
   popd >/dev/null
 }
 
@@ -478,8 +528,16 @@ panel_permissions() {
 create_admin_user() {
   local email="$1" username="$2" password="$3"
   pushd "$PELICAN_ROOT" >/dev/null
-  php artisan p:user:make --no-interaction \
-    --email="$email" --username="$username" --password="$password" --admin=1
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    php artisan p:user:make --no-interaction --no-ansi \
+      --email="$email" --username="$username" --password="$password" --admin=1 >>"$EXPRESS_LOG" 2>&1 || {
+      error "Could not create admin user; see $EXPRESS_LOG"
+      exit 1
+    }
+  else
+    php artisan p:user:make --no-interaction \
+      --email="$email" --username="$username" --password="$password" --admin=1
+  fi
   popd >/dev/null
 }
 
@@ -632,7 +690,16 @@ install_docker() {
     return 0
   fi
   info "Installing Docker CE (get.docker.com)…"
-  curl -fsSL https://get.docker.com/ | CHANNEL=stable sh
+  if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+    local dlog="/tmp/pelican-docker-install.log"
+    if ! curl -fsSL https://get.docker.com/ | CHANNEL=stable sh >"$dlog" 2>&1; then
+      error "Docker install script failed; tail of $dlog:"
+      tail -n 50 "$dlog" >&2
+      exit 1
+    fi
+  else
+    curl -fsSL https://get.docker.com/ | CHANNEL=stable sh
+  fi
   systemctl enable --now docker
 }
 
@@ -730,12 +797,21 @@ print_summary() {
   if [[ -n "${SUMMARY[panel_path]:-}" ]]; then
     printf '  %s%-22s%s %s\n' "$BOLD" "Panel path" "$RESET" "${SUMMARY[panel_path]}"
   fi
-  if [[ -n "${SUMMARY[panel_url]:-}" ]]; then
-    printf '  %s%-22s%s %s\n' "$BOLD" "Panel URL" "$RESET" "${SUMMARY[panel_url]}"
-    printf '  %s%-22s%s %s\n' "$BOLD" "Web installer URL" "$RESET" "${SUMMARY[panel_url]}/installer"
-  fi
-  if [[ -n "${SUMMARY[db_name]:-}" ]]; then
+
+  if [[ -n "${SUMMARY[panel_url]:-}" && ( "${SUMMARY[components]:-}" == "panel" || "${SUMMARY[components]:-}" == "both" ) ]]; then
     echo
+    printf '  %s%s%s\n' "$C_HEAD" "  Log in to the Panel (same as above if you already saw the banner)" "$RESET"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Panel URL" "$RESET" "${SUMMARY[panel_url]}"
+    printf '  %s%-22s%s %s\n' "$BOLD" "  Web installer" "$RESET" "${SUMMARY[panel_url]}/installer"
+    if [[ -n "${SUMMARY[admin_email]:-}" ]]; then
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Admin email" "$RESET" "${SUMMARY[admin_email]}"
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Admin username" "$RESET" "${SUMMARY[admin_username]}"
+      printf '  %s%-22s%s %s\n' "$BOLD" "  Admin password" "$RESET" "${SUMMARY[admin_password]}"
+    fi
+    echo
+  fi
+
+  if [[ -n "${SUMMARY[db_name]:-}" ]]; then
     printf '  %s%s%s\n' "$C_HEAD" "  Web installer — Database step (same values if you finish setup in the browser)" "$RESET"
     if [[ -n "${SUMMARY[db_ui_driver]:-}" ]]; then
       printf '  %s%-22s%s %s\n' "$BOLD" "  Driver (dropdown)" "$RESET" "${SUMMARY[db_ui_driver]}"
@@ -754,7 +830,7 @@ print_summary() {
     printf '  %s%-22s%s %s\n' "$BOLD" "  Password" "$RESET" "${SUMMARY[db_password]}"
     echo
   fi
-  if [[ -n "${SUMMARY[admin_email]:-}" ]]; then
+  if [[ -n "${SUMMARY[admin_email]:-}" && ! ( "${SUMMARY[components]:-}" == "panel" || "${SUMMARY[components]:-}" == "both" ) ]]; then
     printf '  %s%-22s%s %s\n' "$BOLD" "Admin email" "$RESET" "${SUMMARY[admin_email]}"
     printf '  %s%-22s%s %s\n' "$BOLD" "Admin username" "$RESET" "${SUMMARY[admin_username]}"
     printf '  %s%-22s%s %s\n' "$BOLD" "Admin password" "$RESET" "${SUMMARY[admin_password]}"
@@ -819,10 +895,35 @@ set_summary_db_web_installer_info() {
   esac
 }
 
+# Shown as soon as the Panel responds; lets the user log in before Docker/Wings.
+print_panel_login_banner() {
+  local panel_url="$1" email="$2" user="$3" pass="$4"
+  section "Panel is ready — log in here first"
+  echo
+  printf '  %s%-20s%s %s\n' "$BOLD" "Panel URL" "$RESET" "$panel_url"
+  printf '  %s%-20s%s %s\n' "$BOLD" "Web installer" "$RESET" "${panel_url}/installer"
+  printf '     %s%s%s\n' "$C_MUTED" "(Database was configured by this script; you can skip the DB step or match values below.)" "$RESET"
+  echo
+  printf '  %s%-20s%s %s\n' "$BOLD" "Admin email" "$RESET" "$email"
+  printf '  %s%-20s%s %s\n' "$BOLD" "Admin username" "$RESET" "$user"
+  printf '  %s%-20s%s %s\n' "$BOLD" "Admin password" "$RESET" "$pass"
+  echo
+}
+
+pause_before_wings_install() {
+  echo
+  printf '%s%s%s\n' "$C_HEAD" "When you are ready, this script will install Docker and the Wings binary on this server." "$RESET"
+  muted "Tip: open the Panel in your browser, go to Admin -> Nodes -> Create New, then use Configuration / Auto Deploy for Wings after binaries are installed."
+  echo
+  printf '%s>%s %s\n' "$C_ACCENT" "$RESET" "Press Enter to continue with Docker + Wings installation…" >&2
+  read_tty -r _
+  echo
+}
+
 # Shown when installing Panel + Wings: Panel must be ready first; explains remote / APP_URL.
 wings_setup_guidance() {
   local panel_base="$1"
-  section "Step 2 — Wings (after the Panel is installed)"
+  section "Wings setup (do this in the Panel)"
   info "The Wings config field \"remote\" must match how the Panel is reached (same as APP_URL in .env)."
   printf '  %s%-20s%s %s\n' "$BOLD" "Set APP_URL to" "$RESET" "${panel_base}"
   muted "If you open the Panel in the browser as http://192.168.x.x, that exact base URL must be APP_URL and Wings \"remote\"."
@@ -842,6 +943,12 @@ wings_setup_guidance() {
 # Express flow
 # ---------------------------------------------------------------------------
 run_express() {
+  QUIET_INSTALL=1
+  : >"$EXPRESS_LOG"
+  {
+    echo "--- pelican express $(date -Iseconds 2>/dev/null || date) ---"
+  } >>"$EXPRESS_LOG"
+
   SUMMARY[mode]="express"
   menu_components
 
@@ -873,22 +980,27 @@ run_express() {
 
   if [[ "$INSTALL_COMPONENTS" == "panel" || "$INSTALL_COMPONENTS" == "both" ]]; then
     section "Step 1 — Pelican Panel"
+    local etotal=4
+    express_step 1 "$etotal" "System packages (nginx, MariaDB, PHP)…"
     select_php_version
-    info "Installing packages (nginx, MariaDB, PHP ${PHP_VERSION})…"
     apt_install_panel_deps
-    info "Creating database…"
+    express_step 2 "$etotal" "Creating database and MySQL user…"
     create_database_and_user "$db_name" "$db_user" "$db_pass"
-    info "Installing panel files…"
+    express_step 3 "$etotal" "Panel release + Composer (this can take several minutes)…"
     install_panel_files
-    info "Configuring environment & migrations…"
+    express_step 4 "$etotal" "Environment, migrations, admin account, Nginx, APP_URL…"
     configure_panel_env "$db_name" "$db_user" "$db_pass"
-    info "Creating administrator…"
     create_admin_user "$admin_email" "$admin_user" "$admin_pass"
     panel_permissions
     setup_cron
     nginx_write_site "$fqdn" 0
     apply_app_url_to_dotenv "http://${fqdn}"
-    ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
+    if [[ "${QUIET_INSTALL:-0}" == "1" ]]; then
+      ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction -q 2>/dev/null ) || \
+        ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
+    else
+      ( cd "$PELICAN_ROOT" && php artisan config:clear --no-interaction )
+    fi
     SUMMARY[panel_path]="$PELICAN_ROOT"
     SUMMARY[app_key]="$(extract_app_key)"
     SUMMARY[db_name]="$db_name"
@@ -898,20 +1010,28 @@ run_express() {
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
+    print_panel_login_banner "http://${fqdn}" "$admin_email" "$admin_user" "$admin_pass"
     wings_setup_guidance "http://${fqdn}"
-  fi
-
-  if [[ "$INSTALL_COMPONENTS" == "wings" || "$INSTALL_COMPONENTS" == "both" ]]; then
-    if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
-      section "Step 2 — Docker + Wings (binaries and systemd)"
-    else
-      section "Wings — Docker + Wings (binaries and systemd)"
-    fi
+    pause_before_wings_install
+    section "Step 2 — Docker + Wings"
+    express_step 1 2 "Docker Engine…"
     install_docker
+    express_step 2 2 "Wings binary + systemd unit…"
     install_wings_binary
     wings_systemd
     SUMMARY[wings_installed]="yes"
-    info "Wings: create the node in the Panel, ensure config.yml \"remote\" matches APP_URL, then: sudo systemctl start wings"
+    info "After /etc/pelican/config.yml is in place: sudo systemctl start wings"
+  fi
+
+  if [[ "$INSTALL_COMPONENTS" == "wings" ]]; then
+    section "Wings only — Docker + Wings"
+    express_step 1 2 "Docker Engine…"
+    install_docker
+    express_step 2 2 "Wings binary + systemd unit…"
+    install_wings_binary
+    wings_systemd
+    SUMMARY[wings_installed]="yes"
+    info "Create the node in the Panel, then: sudo systemctl start wings"
   fi
 
   print_summary
@@ -1064,21 +1184,23 @@ run_manual() {
       if [[ ! "$gurl" == http://* && ! "$gurl" == https://* ]]; then
         gurl="http://${fqdn}"
       fi
+      print_panel_login_banner "$gurl" "$admin_email" "$admin_user" "$admin_pass"
       wings_setup_guidance "$gurl"
+      pause_before_wings_install
     }
   fi
 
   if [[ "$INSTALL_COMPONENTS" == "wings" || "$INSTALL_COMPONENTS" == "both" ]]; then
     if [[ "$INSTALL_COMPONENTS" == "both" ]]; then
-      section "Step 2 — Docker + Wings (binaries and systemd)"
+      section "Step 2 — Docker + Wings"
     else
-      section "Wings — Docker + Wings (binaries and systemd)"
+      section "Wings only — Docker + Wings"
     fi
     install_docker
     install_wings_binary
     wings_systemd
     SUMMARY[wings_installed]="yes"
-    info "Wings: create the node in the Panel, ensure config.yml \"remote\" matches APP_URL, then: sudo systemctl start wings"
+    info "After /etc/pelican/config.yml is in place: sudo systemctl start wings"
   fi
 
   print_summary
